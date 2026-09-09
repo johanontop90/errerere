@@ -1,0 +1,111 @@
+import os
+import requests
+import json
+import time
+from telegram import Bot
+
+# --- CONFIGURATION ---
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TIKTOK_USERNAMES = ["charlidamelio", "addisonrae"] # Add your target users here
+CHECK_INTERVAL = 300  # Check every 5 minutes (seconds)
+STATE_FILE = "last_seen.json"
+
+# Initialize Bot
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+# Load last seen state
+try:
+    with open(STATE_FILE, 'r') as f:
+        last_seen = json.load(f)
+except FileNotFoundError:
+    last_seen = {}
+
+def get_tiktok_profile_data(username):
+    """
+    Fetches recent posts for a user using TikTok's mobile API.
+    Note: This API endpoint may change. If it breaks, you may need to use a library like `tiktok-scraper`.
+    """
+    # Clean username (remove @ if present)
+    user = username.lstrip('@')
+    url = f"https://www.tiktok.com/api/post/item_list/?uniqueId={user}&count=5&cursor=0&secUid=&itemId=&id={user}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 13_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Mobile/15E148 Safari/604.1",
+        "Referer": f"https://www.tiktok.com/@{user}"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('itemList', [])
+    except Exception as e:
+        print(f"Error fetching data for {user}: {e}")
+    return []
+
+def get_media_url_and_type(item):
+    """Extracts video/image URL and determines type."""
+    # TikTok API returns video info in item['video']
+    video_info = item.get('video', {})
+    play_addr = video_info.get('playAddr', '')
+    
+    # If it's a video, send video. If it's an image (carousel), handle accordingly.
+    # For simplicity, we assume video for now. 
+    # If playAddr is empty, it might be an image. Check 'imagePost' field.
+    if play_addr:
+        return play_addr, 'video'
+    
+    # Fallback for images
+    if 'imagePost' in item:
+        images = item['imagePost'].get('images', [])
+        if images:
+            return images[0]['url'], 'photo'
+            
+    return None, None
+
+def send_to_telegram(media_url, media_type, caption):
+    """Sends media to Telegram."""
+    if not media_url:
+        return
+    
+    try:
+        response = requests.get(media_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if response.status_code == 200:
+            if media_type == 'video':
+                bot.send_video(chat_id=TELEGRAM_CHAT_ID, video=response.content, caption=caption)
+            elif media_type == 'photo':
+                bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=response.content, caption=caption)
+            print(f"Sent {media_type} to Telegram")
+    except Exception as e:
+        print(f"Error sending to Telegram: {e}")
+
+def main():
+    print("Bot started. Monitoring TikTok...")
+    while True:
+        for username in TIKTOK_USERNAMES:
+            posts = get_tiktok_profile_data(username)
+            
+            if not posts:
+                continue
+                
+            # Get the most recent post ID
+            latest_post_id = posts[0].get('id')
+            
+            if latest_post_id and latest_post_id != last_seen.get(username):
+                print(f"New post detected from @{username}: {latest_post_id}")
+                
+                # Extract media
+                media_url, media_type = get_media_url_and_type(posts[0])
+                caption = f"New post from @{username}\n\n👀 Watch here: https://www.tiktok.com/@{username.lstrip('@')}"
+                
+                send_to_telegram(media_url, media_type, caption)
+                
+                # Update state
+                last_seen[username] = latest_post_id
+                with open(STATE_FILE, 'w') as f:
+                    json.dump(last_seen, f)
+        
+        print(f"Checked all users. Sleeping for {CHECK_INTERVAL} seconds...")
+        time.sleep(CHECK_INTERVAL)
+
+if __name__ == "__main__":
+    main()
