@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
@@ -12,8 +13,6 @@ from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     CommandHandler,
-    MessageHandler,
-    filters,
 )
 
 # ================== CONFIGURATION ==================
@@ -21,7 +20,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
 CONFIG_FILE = "config.json"
 COOKIES_FILE = "cookies.txt"
-CHECK_INTERVAL = 300  # 5 minutes in seconds
+CHECK_INTERVAL = 300  # 5 minutes
 
 if not TELEGRAM_BOT_TOKEN or not ALERT_CHAT_ID:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or ALERT_CHAT_ID environment variables.")
@@ -63,7 +62,7 @@ def save_config():
     except Exception as e:
         logger.error(f"Error saving config: {e}")
 
-# ================== TIKTOK SCRAPER (ADVANCED YT-DLP) ==================
+# ================== TIKTOK SCRAPER ==================
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -76,7 +75,7 @@ HEADERS = {
 }
 
 def fetch_latest_posts(username: str, max_results: int = 3) -> List[Dict[str, Any]]:
-    """Fetch recent posts for a TikTok user using anti-bot bypass parameters."""
+    """Fetch recent posts forcing live requests without cache."""
     profile_url = f"https://www.tiktok.com/@{username}"
     
     ydl_opts: Dict[str, Any] = {
@@ -85,8 +84,8 @@ def fetch_latest_posts(username: str, max_results: int = 3) -> List[Dict[str, An
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
+        "cachedir": False,  # Force yt-dlp to bypass disk cache
         "http_headers": HEADERS,
-        # Force mobile extractor arguments to bypass desktop Cloudflare/CAPTCHA blocks
         "extractor_args": {
             "tiktok": {
                 "webpage_download": True,
@@ -94,10 +93,8 @@ def fetch_latest_posts(username: str, max_results: int = 3) -> List[Dict[str, An
         }
     }
 
-    # Automatically attach cookies if present to bypass server IP restrictions
     if os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
-        logger.info(f"Using {COOKIES_FILE} for request authentication.")
 
     posts = []
     try:
@@ -105,32 +102,14 @@ def fetch_latest_posts(username: str, max_results: int = 3) -> List[Dict[str, An
             result = ydl.extract_info(profile_url, download=False)
             if result and "entries" in result:
                 for entry in result["entries"]:
-                    if entry:
+                    if entry and entry.get("id"):
                         posts.append({
                             "id": str(entry.get("id")),
                             "url": entry.get("url") or f"https://www.tiktok.com/@{username}/video/{entry.get('id')}",
                             "title": entry.get("title") or "New TikTok Video"
                         })
     except Exception as e:
-        logger.error(f"yt-dlp failed to fetch profile for @{username}: {e}")
-
-    # Fallback attempt if flat extraction fails
-    if not posts:
-        logger.warning(f"Standard extraction returned 0 posts for @{username}. Retrying with direct video link query...")
-        try:
-            ydl_opts["extract_flat"] = False
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                result = ydl.extract_info(profile_url, download=False)
-                if result and "entries" in result:
-                    for entry in result["entries"]:
-                        if entry:
-                            posts.append({
-                                "id": str(entry.get("id")),
-                                "url": entry.get("webpage_url") or f"https://www.tiktok.com/@{username}/video/{entry.get('id')}",
-                                "title": entry.get("title") or "New TikTok Video"
-                            })
-        except Exception as retry_err:
-            logger.error(f"Fallback extraction also failed for @{username}: {retry_err}")
+        logger.error(f"yt-dlp error for @{username}: {e}")
 
     return posts
 
@@ -140,6 +119,7 @@ def get_direct_video_stream(post_url: str) -> Optional[str]:
         "format": "b[ext=mp4]/best[ext=mp4]/best",
         "quiet": True,
         "no_warnings": True,
+        "cachedir": False,
         "http_headers": HEADERS,
     }
 
@@ -151,76 +131,8 @@ def get_direct_video_stream(post_url: str) -> Optional[str]:
             info = ydl.extract_info(post_url, download=False)
             return info.get("url")
     except Exception as e:
-        logger.warning(f"Failed to extract video stream for {post_url}: {e}")
+        logger.warning(f"Failed stream extraction for {post_url}: {e}")
         return None
-
-# ================== ASYNC MONITOR TASK ==================
-async def check_all_users(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> int:
-    """Checks all users in the monitoring list for new posts."""
-    users = list(config.get("monitored_users", []))
-    found_count = 0
-
-    for username in users:
-        try:
-            loop = context.application.loop
-            posts = await loop.run_in_executor(None, fetch_latest_posts, username, 3)
-
-            if not posts:
-                logger.info(f"No posts retrieved for @{username}. TikTok may be blocking server requests.")
-                continue
-
-            latest = posts[0]
-            post_id = latest.get("id")
-            post_url = latest.get("url")
-            last_seen = config["last_seen"].get(username)
-
-            if not post_id:
-                continue
-
-            if not force and post_id == last_seen:
-                continue
-
-            logger.info(f"New post detected for @{username}: {post_id}")
-            caption = f"🆕 <b>New post from @{username}</b>\n\n{post_url}"
-
-            direct_url = await loop.run_in_executor(None, get_direct_video_stream, post_url)
-            sent_successfully = False
-
-            if direct_url:
-                try:
-                    async with httpx.AsyncClient(headers=HEADERS, timeout=60.0) as client:
-                        response = await client.get(direct_url)
-                        if response.status_code == 200:
-                            await context.bot.send_video(
-                                chat_id=ALERT_CHAT_ID,
-                                video=response.content,
-                                caption=caption,
-                                parse_mode="HTML"
-                            )
-                            sent_successfully = True
-                except Exception as stream_err:
-                    logger.warning(f"Failed sending video stream to Telegram: {stream_err}")
-
-            if not sent_successfully:
-                await context.bot.send_message(
-                    chat_id=ALERT_CHAT_ID,
-                    text=caption,
-                    parse_mode="HTML",
-                    disable_web_page_preview=False
-                )
-
-            config["last_seen"][username] = post_id
-            save_config()
-            found_count += 1
-
-        except Exception as err:
-            logger.error(f"Error checking user @{username}: {err}")
-
-    return found_count
-
-async def scheduled_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job queue task run periodically."""
-    await check_all_users(context, force=False)
 
 # ================== COMMAND HANDLERS ==================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -230,7 +142,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /add &lt;username&gt; – Add user to monitoring list\n"
         "• /remove &lt;username&gt; – Remove user from monitoring list\n"
         "• /list – List all monitored accounts\n"
-        "• /checknow – Force immediate scan\n"
+        "• /checknow – Force step-by-step account check\n"
         "• /online – Show bot uptime"
     )
     await update.message.reply_text(welcome, parse_mode="HTML")
@@ -280,12 +192,74 @@ async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Checking all monitored accounts now...")
-    found = await check_all_users(context, force=True)
-    if found == 0:
-        await update.message.reply_text("ℹ️ Check completed: No new posts detected or accounts are already up to date.")
-    else:
-        await update.message.reply_text(f"✅ Check completed! Found and sent {found} post(s).")
+    """Executes a real-time account-by-account check with live status output."""
+    users = list(config.get("monitored_users", []))
+    if not users:
+        await update.message.reply_text("📋 No accounts in monitoring list. Add one using <code>/add username</code>", parse_mode="HTML")
+        return
+
+    status_msg = await update.message.reply_text("⏳ <b>Starting live scan...</b>", parse_mode="HTML")
+    
+    logs = ["🔍 <b>Live Account Check Progress:</b>\n"]
+    found_total = 0
+
+    for idx, username in enumerate(users, start=1):
+        # Update progress header
+        current_status = f"🔄 Checking [{idx}/{len(users)}]: <b>@{username}</b>..."
+        await status_msg.edit_text("\n".join(logs + [current_status]), parse_mode="HTML")
+
+        # Run extraction non-blockingly
+        loop = asyncio.get_running_loop()
+        posts = await loop.run_in_executor(None, fetch_latest_posts, username, 3)
+
+        if not posts:
+            logs.append(f"❌ <b>@{username}</b>: TikTok blocked request or 0 posts found.")
+            continue
+
+        latest = posts[0]
+        post_id = latest.get("id")
+        post_url = latest.get("url")
+        last_seen = config["last_seen"].get(username)
+
+        if post_id == last_seen:
+            logs.append(f"ℹ️ <b>@{username}</b>: Up to date (Latest ID: <code>{post_id}</code>)")
+        else:
+            logs.append(f"🆕 <b>@{username}</b>: <b>NEW POST DETECTED!</b> (ID: <code>{post_id}</code>)")
+            found_total += 1
+
+            # Dispatch video/link alert to alert channel/user
+            caption = f"🆕 <b>New post from @{username}</b>\n\n{post_url}"
+            direct_url = await loop.run_in_executor(None, get_direct_video_stream, post_url)
+            sent = False
+
+            if direct_url:
+                try:
+                    async with httpx.AsyncClient(headers=HEADERS, timeout=60.0) as client:
+                        res = await client.get(direct_url)
+                        if res.status_code == 200:
+                            await context.bot.send_video(
+                                chat_id=ALERT_CHAT_ID,
+                                video=res.content,
+                                caption=caption,
+                                parse_mode="HTML"
+                            )
+                            sent = True
+                except Exception as e:
+                    logger.warning(f"Could not send stream video: {e}")
+
+            if not sent:
+                await context.bot.send_message(
+                    chat_id=ALERT_CHAT_ID,
+                    text=caption,
+                    parse_mode="HTML"
+                )
+
+            # Update state
+            config["last_seen"][username] = post_id
+            save_config()
+
+    logs.append(f"\n🏁 <b>Scan complete.</b> Found {found_total} new post(s).")
+    await status_msg.edit_text("\n".join(logs), parse_mode="HTML")
 
 async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_ts = float(os.environ.get("START_TIME", time.time()))
@@ -316,12 +290,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("checknow", checknow_command))
     app.add_handler(CommandHandler("online", online_command))
 
-    if app.job_queue:
-        app.job_queue.run_repeating(
-            scheduled_monitor_job,
-            interval=CHECK_INTERVAL,
-            first=10
-        )
-
-    logger.info("Bot starting up...")
+    logger.info("Bot running...")
     app.run_polling(drop_pending_updates=True)
