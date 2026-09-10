@@ -2,31 +2,41 @@ import os
 import requests
 import json
 import time
-from telegram import Bot
+import base64
+import sys
+from datetime import datetime, timezone
+from telegram import Bot, Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+import threading
 
 # --- CONFIGURATION ---
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-TIKTOK_USERNAMES = ["charlidamelio", "addisonrae"] # Add your target users here
-CHECK_INTERVAL = 300  # Check every 5 minutes (seconds)
-STATE_FILE = "last_seen.json"
+ALERT_CHAT_ID = int(os.getenv('ALERT_CHAT_ID')) 
+CONFIG_FILE = "config.json"
 
-# Initialize Bot
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-
-# Load last seen state
+# Load config
 try:
-    with open(STATE_FILE, 'r') as f:
-        last_seen = json.load(f)
+    with open(CONFIG_FILE, 'r') as f:
+        config = json.load(f)
 except FileNotFoundError:
-    last_seen = {}
+    config = {
+        "monitored_users": [], # Stores Base64 strings
+        "last_seen": {}
+    }
+
+def save_config():
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f)
+
+def encode_username(username):
+    """Convert username to Base64 string"""
+    return base64.b64encode(username.encode('utf-8')).decode('utf-8')
+
+def decode_username(b64_username):
+    """Convert Base64 string back to username"""
+    return base64.b64decode(b64_username.encode('utf-8')).decode('utf-8')
 
 def get_tiktok_profile_data(username):
-    """
-    Fetches recent posts for a user using TikTok's mobile API.
-    Note: This API endpoint may change. If it breaks, you may need to use a library like `tiktok-scraper`.
-    """
-    # Clean username (remove @ if present)
     user = username.lstrip('@')
     url = f"https://www.tiktok.com/api/post/item_list/?uniqueId={user}&count=5&cursor=0&secUid=&itemId=&id={user}"
     headers = {
@@ -43,69 +53,148 @@ def get_tiktok_profile_data(username):
     return []
 
 def get_media_url_and_type(item):
-    """Extracts video/image URL and determines type."""
-    # TikTok API returns video info in item['video']
     video_info = item.get('video', {})
     play_addr = video_info.get('playAddr', '')
-    
-    # If it's a video, send video. If it's an image (carousel), handle accordingly.
-    # For simplicity, we assume video for now. 
-    # If playAddr is empty, it might be an image. Check 'imagePost' field.
     if play_addr:
         return play_addr, 'video'
-    
-    # Fallback for images
     if 'imagePost' in item:
         images = item['imagePost'].get('images', [])
         if images:
             return images[0]['url'], 'photo'
-            
     return None, None
 
-def send_to_telegram(media_url, media_type, caption):
-    """Sends media to Telegram."""
-    if not media_url:
-        return
-    
-    try:
-        response = requests.get(media_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        if response.status_code == 200:
-            if media_type == 'video':
-                bot.send_video(chat_id=TELEGRAM_CHAT_ID, video=response.content, caption=caption)
-            elif media_type == 'photo':
-                bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=response.content, caption=caption)
-            print(f"Sent {media_type} to Telegram")
-    except Exception as e:
-        print(f"Error sending to Telegram: {e}")
+# --- COMMAND HANDLERS ---
 
-def main():
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome! I am your TikTok Monitor Bot. 🤖\n\nUse /help for commands.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+<b>TikTok Monitor Bot Commands:</b>
+
+/add <username> - Add a user to monitor (e.g., /add charlidamelio)
+/remove <username> - Remove a user from monitoring
+/list - View currently monitored users (encoded)
+/online - See how long I've been running
+"""
+    await update.message.reply_text(help_text, parse_mode='HTML')
+
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        username = context.args[0].lstrip('@')
+        encoded = encode_username(username)
+        if encoded not in config["monitored_users"]:
+            config["monitored_users"].append(encoded)
+            config["last_seen"][encoded] = None 
+            save_config()
+            await update.message.reply_text(f"✅ Added @{username} to monitoring list (stored as ID).")
+        else:
+            await update.message.reply_text(f"❌ @{username} is already being monitored.")
+    else:
+        await update.message.reply_text("❌ Please provide a username. Usage: /add username")
+
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        username = context.args[0].lstrip('@')
+        encoded = encode_username(username)
+        if encoded in config["monitored_users"]:
+            config["monitored_users"].remove(encoded)
+            if encoded in config["last_seen"]:
+                del config["last_seen"][encoded]
+            save_config()
+            await update.message.reply_text(f"✅ Removed @{username} from monitoring list.")
+        else:
+            await update.message.reply_text(f"❌ @{username} is not in the monitoring list.")
+    else:
+        await update.message.reply_text("❌ Please provide a username. Usage: /remove username")
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if config["monitored_users"]:
+        users_text = "📋 <b>Monitored Users (Base64):**\n\n"
+        for encoded_user in config["monitored_users"]:
+            # Decode just to show the real name in the chat
+            real_name = decode_username(encoded_user)
+            users_text += f"• @{real_name} (ID: `{encoded_user}`)\n"
+        await update.message.reply_text(users_text, parse_mode='HTML')
+    else:
+        await update.message.reply_text("📋 No users are currently being monitored.")
+
+async def online(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = datetime.fromtimestamp(os.environ.get('START_TIME', time.time()), tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    duration = now - start_time
+    days = duration.days
+    hours, remainder = divmod(duration.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_text = f"⏱️ <b>Bot Uptime:</b>\n\n{days} days, {hours} hours, {minutes} minutes, {seconds} seconds."
+    await update.message.reply_text(uptime_text, parse_mode='HTML')
+
+# --- MAIN MONITORING LOGIC ---
+
+def monitor_loop():
     print("Bot started. Monitoring TikTok...")
     while True:
-        for username in TIKTOK_USERNAMES:
+        # Iterate through encoded usernames
+        for encoded_user in config["monitored_users"]:
+            username = decode_username(encoded_user)
             posts = get_tiktok_profile_data(username)
             
             if not posts:
                 continue
                 
-            # Get the most recent post ID
             latest_post_id = posts[0].get('id')
             
-            if latest_post_id and latest_post_id != last_seen.get(username):
+            if latest_post_id and config["last_seen"].get(encoded_user) != latest_post_id:
                 print(f"New post detected from @{username}: {latest_post_id}")
                 
-                # Extract media
                 media_url, media_type = get_media_url_and_type(posts[0])
-                caption = f"New post from @{username}\n\n👀 Watch here: https://www.tiktok.com/@{username.lstrip('@')}"
+                caption = f"New post from @{username}\n\n👀 Watch here: https://www.tiktok.com/@{username}"
                 
-                send_to_telegram(media_url, media_type, caption)
-                
-                # Update state
-                last_seen[username] = latest_post_id
-                with open(STATE_FILE, 'w') as f:
-                    json.dump(last_seen, f)
+                try:
+                    if media_url:
+                        r = requests.get(media_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                        if r.status_code == 200:
+                            if media_type == 'video':
+                                requests.post(
+                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo",
+                                    data={
+                                        'chat_id': ALERT_CHAT_ID,
+                                        'caption': caption
+                                    },
+                                    files={'video': r.content}
+                                )
+                            elif media_type == 'photo':
+                                requests.post(
+                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                                    data={
+                                        'chat_id': ALERT_CHAT_ID,
+                                        'caption': caption
+                                    },
+                                    files={'photo': r.content}
+                                )
+                    # Update state using the encoded key
+                    config["last_seen"][encoded_user] = latest_post_id
+                    save_config()
+                except Exception as e:
+                    print(f"Error sending alert: {e}")
         
-        print(f"Checked all users. Sleeping for {CHECK_INTERVAL} seconds...")
-        time.sleep(CHECK_INTERVAL)
+        print(f"Checked all users. Sleeping for 300 seconds...")
+        time.sleep(300)
 
 if __name__ == "__main__":
-    main()
+    os.environ['START_TIME'] = str(int(time.time()))
+    
+    monitor_thread = threading.Thread(target=monitor_loop)
+    monitor_thread.start()
+    
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("add", add_user))
+    app.add_handler(CommandHandler("remove", remove_user))
+    app.add_handler(CommandHandler("list", list_users))
+    app.add_handler(CommandHandler("online", online))
+    
+    print("Telegram Bot is listening...")
+    app.run_polling()
