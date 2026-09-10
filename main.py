@@ -8,13 +8,13 @@ from typing import Optional, Dict, Any, List
 
 import requests
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 # ================== CONFIG ==================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
 CONFIG_FILE = "config.json"
-CHECK_INTERVAL = 300  # 5 minutes
+CHECK_INTERVAL = 300
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
@@ -59,7 +59,7 @@ def save_config():
         except Exception as e:
             logger.error(f"Error saving config: {e}")
 
-# ================== TIKTOK ==================
+# ================== TIKTOK (same as before) ==================
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
     "Accept": "application/json, text/plain, */*",
@@ -121,6 +121,7 @@ def get_media_info(item: Dict) -> tuple[Optional[str], Optional[str]]:
 
 # ================== COMMANDS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /start from {update.effective_user.id}")
     await update.message.reply_text(
         "👋 <b>TikTok Monitor Bot</b>\n\n"
         "Commands:\n"
@@ -136,6 +137,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /add from {update.effective_user.id}")
     if not context.args:
         await update.message.reply_text("Usage: /add username")
         return
@@ -156,6 +158,7 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Now monitoring @{username}")
 
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /remove from {update.effective_user.id}")
     if not context.args:
         await update.message.reply_text("Usage: /remove username")
         return
@@ -173,6 +176,7 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Removed @{username}")
 
 async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /list from {update.effective_user.id}")
     with config_lock:
         users = config.get("monitored_users", [])
 
@@ -184,6 +188,7 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 async def online(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /online from {update.effective_user.id}")
     start_ts = float(os.environ.get("START_TIME", time.time()))
     start_time = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     now = datetime.now(timezone.utc)
@@ -197,6 +202,10 @@ async def online(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏱ Uptime: <b>{days}d {hours}h {minutes}m {seconds}s</b>",
         parse_mode="HTML"
     )
+
+# Catch-all for debugging
+async def debug_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"DEBUG - Received message: {update.message.text if update.message else 'No text'} from user {update.effective_user.id}")
 
 # ================== MONITORING ==================
 def monitor_loop():
@@ -291,5 +300,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("list", list_users))
     app.add_handler(CommandHandler("online", online))
 
-    logger.info("Bot is running...")
+    # This will catch everything else for debugging
+    app.add_handler(MessageHandler(filters.ALL, debug_all))
+
+    logger.info("Bot is running (DEBUG MODE)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
