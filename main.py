@@ -1,9 +1,7 @@
 import os
 import json
 import time
-import re
 import logging
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
@@ -18,6 +16,7 @@ from telegram.ext import (
 # ================== CONFIGURATION ==================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "5e0accb80dmshac265d29cc278d6p1913fdjsn02f9fb70c725")
 CONFIG_FILE = "config.json"
 CHECK_INTERVAL = 300  # 5 minutes
 
@@ -61,69 +60,87 @@ def save_config():
     except Exception as e:
         logger.error(f"Error saving config: {e}")
 
-# ================== DUAL SCRAPER ENGINE ==================
-async def fetch_tikwm(username: str) -> List[Dict[str, Any]]:
-    """Engine 1: TikWM Public API."""
-    url = f"https://www.tikwm.com/api/user/posts?unique_id={username}&count=5"
+# ================== RAPIDAPI SCRAPER ENGINE ==================
+async def fetch_latest_posts(username: str) -> List[Dict[str, Any]]:
+    """Fetches user posts using Realtime Tiktok Data Scraper via RapidAPI."""
+    url = "https://realtime-tiktok-data-scraper.p.rapidapi.com/get_collection_by_user.php"
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json"
+        "x-rapidapi-host": "realtime-tiktok-data-scraper.p.rapidapi.com",
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "Content-Type": "application/json"
     }
+    
+    params = {
+        "unique_id": username.lstrip("@"),
+        "count": "5",
+        "cursor": "0"
+    }
+    
     posts = []
     try:
-        async with httpx.AsyncClient(headers=headers, timeout=12.0) as client:
-            res = await client.get(url)
+        async with httpx.AsyncClient(headers=headers, timeout=20.0) as client:
+            res = await client.get(url, params=params)
+            logger.info(f"RapidAPI Response Status for @{username}: {res.status_code}")
+            
             if res.status_code == 200:
                 data = res.json()
-                if data.get("code") == 0 and "data" in data and "videos" in data["data"]:
-                    for vid in data["data"]["videos"]:
-                        video_id = str(vid.get("video_id"))
+                
+                # Unpack response items dynamically across different potential schemas
+                items = []
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    if "data" in data and isinstance(data["data"], list):
+                        items = data["data"]
+                    elif "data" in data and isinstance(data["data"], dict):
+                        items = data["data"].get("videos") or data["data"].get("itemList") or data["data"].get("aweme_list") or []
+                    else:
+                        items = data.get("aweme_list") or data.get("itemList") or data.get("videos") or []
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+
+                    # Extract video ID
+                    video_id = str(
+                        item.get("aweme_id") or 
+                        item.get("id") or 
+                        item.get("video_id") or 
+                        item.get("item_id") or ""
+                    )
+                    
+                    # Extract direct play URL
+                    play_url = None
+                    video_info = item.get("video")
+                    if isinstance(video_info, dict):
+                        play_addr = video_info.get("play_addr") or video_info.get("download_addr")
+                        if isinstance(play_addr, dict):
+                            urls = play_addr.get("url_list", [])
+                            if urls:
+                                play_url = urls[0]
+                        elif isinstance(video_info.get("play_addr"), str):
+                            play_url = video_info.get("play_addr")
+                            
+                    if not play_url:
+                        play_url = item.get("play") or item.get("video_url") or item.get("direct_url")
+
+                    # Extract title / description
+                    title = item.get("desc") or item.get("title") or "New TikTok Video"
+
+                    if video_id:
                         posts.append({
                             "id": video_id,
                             "url": f"https://www.tiktok.com/@{username}/video/{video_id}",
-                            "direct_video_url": vid.get("play"),
-                            "title": vid.get("title") or "New TikTok Video"
+                            "direct_video_url": play_url,
+                            "title": title
                         })
+            else:
+                logger.error(f"RapidAPI request failed ({res.status_code}): {res.text[:200]}")
+                
     except Exception as e:
-        logger.warning(f"TikWM engine failed for @{username}: {e}")
-    return posts
-
-async def fetch_rsshub(username: str) -> List[Dict[str, Any]]:
-    """Engine 2: RSSHub Feed Fallback."""
-    url = f"https://rsshub.app/tiktok/user/@{username}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/rss+xml, application/xml;q=0.9"
-    }
-    posts = []
-    try:
-        async with httpx.AsyncClient(headers=headers, timeout=12.0) as client:
-            res = await client.get(url)
-            if res.status_code == 200:
-                root = ET.fromstring(res.text)
-                channel = root.find("channel")
-                if channel is not None:
-                    for item in channel.findall("item"):
-                        link = item.findtext("link") or ""
-                        match = re.search(r'/video/(\d+)', link)
-                        if match:
-                            video_id = match.group(1)
-                            posts.append({
-                                "id": video_id,
-                                "url": f"https://www.tiktok.com/@{username}/video/{video_id}",
-                                "direct_video_url": None,
-                                "title": item.findtext("title") or "New TikTok Video"
-                            })
-    except Exception as e:
-        logger.warning(f"RSSHub fallback failed for @{username}: {e}")
-    return posts
-
-async def fetch_latest_posts(username: str) -> List[Dict[str, Any]]:
-    """Fetches user posts trying TikWM first, then RSSHub."""
-    posts = await fetch_tikwm(username)
-    if not posts:
-        logger.info(f"TikWM yielded 0 posts for @{username}, switching to RSSHub fallback...")
-        posts = await fetch_rsshub(username)
+        logger.error(f"Error fetching posts via RapidAPI for @{username}: {e}")
+        
     return posts
 
 # ================== COMMAND HANDLERS ==================
@@ -209,6 +226,7 @@ async def process_account_check(username: str) -> Dict[str, Any]:
     post_id = latest.get("id")
     post_url = latest.get("url")
     direct_url = latest.get("direct_video_url")
+    title = latest.get("title", "")
     last_seen = config["last_seen"].get(username)
 
     if post_id == last_seen:
@@ -219,7 +237,8 @@ async def process_account_check(username: str) -> Dict[str, Any]:
         "message": f"🆕 <b>@{username}</b>: <b>NEW POST DETECTED!</b> (ID: <code>{post_id}</code>)",
         "post_id": post_id,
         "post_url": post_url,
-        "direct_url": direct_url
+        "direct_url": direct_url,
+        "title": title
     }
 
 async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,12 +262,13 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             found_total += 1
             post_url = res["post_url"]
             direct_url = res["direct_url"]
-            caption = f"🆕 <b>New post from @{username}</b>\n\n{post_url}"
+            title = res["title"]
+            caption = f"🆕 <b>New post from @{username}</b>\n\n{title}\n\n{post_url}"
             sent = False
 
             if direct_url:
                 try:
-                    async with httpx.AsyncClient(timeout=60.0) as client:
+                    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
                         response = await client.get(direct_url)
                         if response.status_code == 200:
                             await context.bot.send_video(
@@ -282,12 +302,13 @@ async def scheduled_monitor_job(context: ContextTypes.DEFAULT_TYPE):
         if res["status"] == "new_post":
             post_url = res["post_url"]
             direct_url = res["direct_url"]
-            caption = f"🆕 <b>New post from @{username}</b>\n\n{post_url}"
+            title = res["title"]
+            caption = f"🆕 <b>New post from @{username}</b>\n\n{title}\n\n{post_url}"
             sent = False
 
             if direct_url:
                 try:
-                    async with httpx.AsyncClient(timeout=60.0) as client:
+                    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
                         response = await client.get(direct_url)
                         if response.status_code == 200:
                             await context.bot.send_video(
