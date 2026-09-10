@@ -20,6 +20,7 @@ from telegram.ext import (
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
 CONFIG_FILE = "config.json"
+COOKIES_FILE = "cookies.txt"
 CHECK_INTERVAL = 300  # 5 minutes in seconds
 
 if not TELEGRAM_BOT_TOKEN or not ALERT_CHAT_ID:
@@ -62,26 +63,41 @@ def save_config():
     except Exception as e:
         logger.error(f"Error saving config: {e}")
 
-# ================== TIKTOK SCRAPER (YT-DLP) ==================
+# ================== TIKTOK SCRAPER (ADVANCED YT-DLP) ==================
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/17.0 Mobile/15E148 Safari/604.1"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.tiktok.com/",
 }
 
 def fetch_latest_posts(username: str, max_results: int = 3) -> List[Dict[str, Any]]:
-    """Fetch recent posts for a TikTok user using yt-dlp."""
+    """Fetch recent posts for a TikTok user using anti-bot bypass parameters."""
     profile_url = f"https://www.tiktok.com/@{username}"
-    ydl_opts = {
+    
+    ydl_opts: Dict[str, Any] = {
         "extract_flat": True,
         "playlistend": max_results,
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
         "http_headers": HEADERS,
+        # Force mobile extractor arguments to bypass desktop Cloudflare/CAPTCHA blocks
+        "extractor_args": {
+            "tiktok": {
+                "webpage_download": True,
+            }
+        }
     }
+
+    # Automatically attach cookies if present to bypass server IP restrictions
+    if os.path.exists(COOKIES_FILE):
+        ydl_opts["cookiefile"] = COOKIES_FILE
+        logger.info(f"Using {COOKIES_FILE} for request authentication.")
 
     posts = []
     try:
@@ -98,16 +114,38 @@ def fetch_latest_posts(username: str, max_results: int = 3) -> List[Dict[str, An
     except Exception as e:
         logger.error(f"yt-dlp failed to fetch profile for @{username}: {e}")
 
+    # Fallback attempt if flat extraction fails
+    if not posts:
+        logger.warning(f"Standard extraction returned 0 posts for @{username}. Retrying with direct video link query...")
+        try:
+            ydl_opts["extract_flat"] = False
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                result = ydl.extract_info(profile_url, download=False)
+                if result and "entries" in result:
+                    for entry in result["entries"]:
+                        if entry:
+                            posts.append({
+                                "id": str(entry.get("id")),
+                                "url": entry.get("webpage_url") or f"https://www.tiktok.com/@{username}/video/{entry.get('id')}",
+                                "title": entry.get("title") or "New TikTok Video"
+                            })
+        except Exception as retry_err:
+            logger.error(f"Fallback extraction also failed for @{username}: {retry_err}")
+
     return posts
 
 def get_direct_video_stream(post_url: str) -> Optional[str]:
     """Extract direct playable MP4 stream URL."""
-    ydl_opts = {
+    ydl_opts: Dict[str, Any] = {
         "format": "b[ext=mp4]/best[ext=mp4]/best",
         "quiet": True,
         "no_warnings": True,
         "http_headers": HEADERS,
     }
+
+    if os.path.exists(COOKIES_FILE):
+        ydl_opts["cookiefile"] = COOKIES_FILE
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(post_url, download=False)
@@ -124,12 +162,11 @@ async def check_all_users(context: ContextTypes.DEFAULT_TYPE, force: bool = Fals
 
     for username in users:
         try:
-            # Offload synchronous yt-dlp extraction to async loop executor
             loop = context.application.loop
             posts = await loop.run_in_executor(None, fetch_latest_posts, username, 3)
 
             if not posts:
-                logger.info(f"No posts retrieved for @{username} (Profile private or blocked).")
+                logger.info(f"No posts retrieved for @{username}. TikTok may be blocking server requests.")
                 continue
 
             latest = posts[0]
@@ -137,13 +174,15 @@ async def check_all_users(context: ContextTypes.DEFAULT_TYPE, force: bool = Fals
             post_url = latest.get("url")
             last_seen = config["last_seen"].get(username)
 
-            if not post_id or (not force and post_id == last_seen):
+            if not post_id:
+                continue
+
+            if not force and post_id == last_seen:
                 continue
 
             logger.info(f"New post detected for @{username}: {post_id}")
             caption = f"🆕 <b>New post from @{username}</b>\n\n{post_url}"
 
-            # Attempt to download video and send directly via Telegram Bot API
             direct_url = await loop.run_in_executor(None, get_direct_video_stream, post_url)
             sent_successfully = False
 
@@ -162,7 +201,6 @@ async def check_all_users(context: ContextTypes.DEFAULT_TYPE, force: bool = Fals
                 except Exception as stream_err:
                     logger.warning(f"Failed sending video stream to Telegram: {stream_err}")
 
-            # Fallback to plain text alert with video link if media delivery fails
             if not sent_successfully:
                 await context.bot.send_message(
                     chat_id=ALERT_CHAT_ID,
@@ -171,7 +209,6 @@ async def check_all_users(context: ContextTypes.DEFAULT_TYPE, force: bool = Fals
                     disable_web_page_preview=False
                 )
 
-            # Update state
             config["last_seen"][username] = post_id
             save_config()
             found_count += 1
@@ -244,8 +281,11 @@ async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Checking all monitored accounts now...")
-    found = await check_all_users(context, force=False)
-    await update.message.reply_text(f"✅ Scan completed! Found {found} new post(s).")
+    found = await check_all_users(context, force=True)
+    if found == 0:
+        await update.message.reply_text("ℹ️ Check completed: No new posts detected or accounts are already up to date.")
+    else:
+        await update.message.reply_text(f"✅ Check completed! Found and sent {found} post(s).")
 
 async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_ts = float(os.environ.get("START_TIME", time.time()))
@@ -268,7 +308,6 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("add", add_user_command))
@@ -277,7 +316,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("checknow", checknow_command))
     app.add_handler(CommandHandler("online", online_command))
 
-    # Add periodic background task using JobQueue
     if app.job_queue:
         app.job_queue.run_repeating(
             scheduled_monitor_job,
