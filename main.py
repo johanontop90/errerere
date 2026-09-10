@@ -124,107 +124,7 @@ def extract_all_media(item: Dict) -> Tuple[List[str], Optional[str]]:
 
     return photos, video_url
 
-# ================== COMMANDS ==================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /start from {update.effective_user.id}")
-    await update.message.reply_text(
-        "👋 <b>TikTok Monitor Bot</b>\n\n"
-        "Commands:\n"
-        "/add &lt;username&gt; – start monitoring\n"
-        "/remove &lt;username&gt; – stop monitoring\n"
-        "/list – show monitored users\n"
-        "/online – bot uptime\n"
-        "/help",
-        parse_mode="HTML"
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
-
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /add from {update.effective_user.id}")
-    
-    if not context.args:
-        await update.message.reply_text("Usage: /add username")
-        return
-
-    username = context.args[0].lstrip("@").lower().strip()
-    if not username:
-        await update.message.reply_text("Invalid username")
-        return
-
-    try:
-        with config_lock:
-            if username in config["monitored_users"]:
-                await update.message.reply_text(f"@{username} is already being monitored.")
-                return
-            config["monitored_users"].append(username)
-            config["last_seen"][username] = None
-
-        save_config()
-        await update.message.reply_text(f"✅ Now monitoring @{username}")
-        
-    except Exception as e:
-        logger.error(f"Error in /add: {e}")
-        await update.message.reply_text(f"❌ Failed to add @{username}. Error: {e}")
-
-async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /remove from {update.effective_user.id}")
-    
-    if not context.args:
-        await update.message.reply_text("Usage: /remove username")
-        return
-
-    username = context.args[0].lstrip("@").lower().strip()
-
-    try:
-        with config_lock:
-            if username not in config["monitored_users"]:
-                await update.message.reply_text(f"@{username} is not being monitored.")
-                return
-            config["monitored_users"].remove(username)
-            config["last_seen"].pop(username, None)
-
-        save_config()
-        await update.message.reply_text(f"✅ Removed @{username}")
-        
-    except Exception as e:
-        logger.error(f"Error in /remove: {e}")
-        await update.message.reply_text(f"❌ Failed to remove @{username}. Error: {e}")
-
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /list from {update.effective_user.id}")
-    with config_lock:
-        users = config.get("monitored_users", [])
-
-    if not users:
-        await update.message.reply_text("📋 No users are currently being monitored.")
-        return
-
-    text = "📋 <b>Monitored Users</b>\n\n" + "\n".join(f"• @{u}" for u in users)
-    await update.message.reply_text(text, parse_mode="HTML")
-
-async def online(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /online from {update.effective_user.id}")
-    start_ts = float(os.environ.get("START_TIME", time.time()))
-    start_time = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-    now = datetime.now(timezone.utc)
-    delta = now - start_time
-
-    days = delta.days
-    hours, rem = divmod(delta.seconds, 3600)
-    minutes, seconds = divmod(rem, 60)
-
-    await update.message.reply_text(
-        f"⏱ Uptime: <b>{days}d {hours}h {minutes}m {seconds}s</b>",
-        parse_mode="HTML"
-    )
-
-async def debug_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.text:
-        logger.info(f"DEBUG - Received: {update.message.text} from {update.effective_user.id}")
-
-# ================== SENDING MEDIA ==================
+# ================== SENDING ==================
 def send_telegram_message(text: str):
     try:
         requests.post(
@@ -257,11 +157,9 @@ def send_video(video_url: str, caption: str) -> bool:
 def send_photos(photo_urls: List[str], caption: str) -> bool:
     if not photo_urls:
         return False
-
     try:
         media = []
         files = {}
-
         for i, url in enumerate(photo_urls[:10]):
             r = requests.get(url, headers=HEADERS, timeout=20)
             if r.status_code == 200:
@@ -272,15 +170,9 @@ def send_photos(photo_urls: List[str], caption: str) -> bool:
                     "media": f"attach://{file_name}",
                     "caption": caption if i == 0 else ""
                 })
-
         if not media:
             return False
-
-        data = {
-            "chat_id": ALERT_CHAT_ID,
-            "media": json.dumps(media)
-        }
-
+        data = {"chat_id": ALERT_CHAT_ID, "media": json.dumps(media)}
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup",
             data=data,
@@ -292,54 +184,181 @@ def send_photos(photo_urls: List[str], caption: str) -> bool:
         logger.warning(f"Failed to send photos: {e}")
         return False
 
-# ================== MONITORING ==================
+# ================== CHECK LOGIC ==================
+def check_all_users(force: bool = False) -> int:
+    """Check all monitored users for new posts. Returns number of new posts found."""
+    found = 0
+    with config_lock:
+        users = list(config.get("monitored_users", []))
+
+    for username in users:
+        try:
+            posts = get_latest_posts(username, count=3)
+            if not posts:
+                continue
+
+            latest = posts[0]
+            post_id = str(latest.get("id") or "")
+
+            with config_lock:
+                last_seen = config["last_seen"].get(username)
+
+            if not post_id:
+                continue
+
+            if not force and post_id == last_seen:
+                continue
+
+            # New post (or force check)
+            logger.info(f"{'Force check' if force else 'New post'} from @{username}: {post_id}")
+
+            caption = (
+                f"🆕 New post from @{username}\n\n"
+                f"https://www.tiktok.com/@{username}/video/{post_id}"
+            )
+
+            photos, video_url = extract_all_media(latest)
+            sent = False
+
+            if video_url:
+                sent = send_video(video_url, caption)
+            elif photos:
+                sent = send_photos(photos, caption)
+
+            if not sent:
+                send_telegram_message(caption)
+
+            with config_lock:
+                config["last_seen"][username] = post_id
+                save_config()
+
+            found += 1
+
+        except Exception as e:
+            logger.error(f"Error processing @{username}: {e}")
+
+    return found
+
+# ================== COMMANDS ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /start from {update.effective_user.id}")
+    await update.message.reply_text(
+        "👋 <b>TikTok Monitor Bot</b>\n\n"
+        "Commands:\n"
+        "/add &lt;username&gt; – start monitoring\n"
+        "/remove &lt;username&gt; – stop monitoring\n"
+        "/list – show monitored users\n"
+        "/checknow – force check for new posts right now\n"
+        "/online – bot uptime\n"
+        "/help",
+        parse_mode="HTML"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /add from {update.effective_user.id}")
+    if not context.args:
+        await update.message.reply_text("Usage: /add username")
+        return
+
+    username = context.args[0].lstrip("@").lower().strip()
+    if not username:
+        await update.message.reply_text("Invalid username")
+        return
+
+    try:
+        with config_lock:
+            if username in config["monitored_users"]:
+                await update.message.reply_text(f"@{username} is already being monitored.")
+                return
+            config["monitored_users"].append(username)
+            config["last_seen"][username] = None
+
+        save_config()
+        await update.message.reply_text(f"✅ Now monitoring @{username}")
+    except Exception as e:
+        logger.error(f"Error in /add: {e}")
+        await update.message.reply_text(f"❌ Failed to add @{username}. Error: {e}")
+
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /remove from {update.effective_user.id}")
+    if not context.args:
+        await update.message.reply_text("Usage: /remove username")
+        return
+
+    username = context.args[0].lstrip("@").lower().strip()
+
+    try:
+        with config_lock:
+            if username not in config["monitored_users"]:
+                await update.message.reply_text(f"@{username} is not being monitored.")
+                return
+            config["monitored_users"].remove(username)
+            config["last_seen"].pop(username, None)
+
+        save_config()
+        await update.message.reply_text(f"✅ Removed @{username}")
+    except Exception as e:
+        logger.error(f"Error in /remove: {e}")
+        await update.message.reply_text(f"❌ Failed to remove @{username}. Error: {e}")
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /list from {update.effective_user.id}")
+    with config_lock:
+        users = config.get("monitored_users", [])
+
+    if not users:
+        await update.message.reply_text("📋 No users are currently being monitored.")
+        return
+
+    text = "📋 <b>Monitored Users</b>\n\n" + "\n".join(f"• @{u}" for u in users)
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def checknow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /checknow from {update.effective_user.id}")
+    await update.message.reply_text("🔍 Checking for new posts right now...")
+
+    # Run the check in a background thread so it doesn't block the bot
+    def run_check():
+        found = check_all_users(force=False)
+        if found == 0:
+            send_telegram_message("✅ No new posts found.")
+        else:
+            send_telegram_message(f"✅ Found and sent {found} new post(s).")
+
+    threading.Thread(target=run_check, daemon=True).start()
+
+async def online(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /online from {update.effective_user.id}")
+    start_ts = float(os.environ.get("START_TIME", time.time()))
+    start_time = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    delta = now - start_time
+
+    days = delta.days
+    hours, rem = divmod(delta.seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    await update.message.reply_text(
+        f"⏱ Uptime: <b>{days}d {hours}h {minutes}m {seconds}s</b>",
+        parse_mode="HTML"
+    )
+
+async def debug_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.text:
+        logger.info(f"DEBUG - Received: {update.message.text} from {update.effective_user.id}")
+
+# ================== MONITORING LOOP ==================
 def monitor_loop():
     logger.info("Monitoring thread started")
     while True:
-        with config_lock:
-            users = list(config.get("monitored_users", []))
-
-        for username in users:
-            try:
-                posts = get_latest_posts(username, count=3)
-                if not posts:
-                    continue
-
-                latest = posts[0]
-                post_id = str(latest.get("id") or "")
-
-                with config_lock:
-                    last_seen = config["last_seen"].get(username)
-
-                if not post_id or post_id == last_seen:
-                    continue
-
-                logger.info(f"New post from @{username}: {post_id}")
-
-                caption = (
-                    f"🆕 New post from @{username}\n\n"
-                    f"https://www.tiktok.com/@{username}/video/{post_id}"
-                )
-
-                photos, video_url = extract_all_media(latest)
-                sent = False
-
-                if video_url:
-                    sent = send_video(video_url, caption)
-                elif photos:
-                    sent = send_photos(photos, caption)
-
-                if not sent:
-                    send_telegram_message(caption)
-
-                with config_lock:
-                    config["last_seen"][username] = post_id
-                    save_config()
-
-            except Exception as e:
-                logger.error(f"Error processing @{username}: {e}")
-
-        logger.info(f"Checked {len(users)} users → sleeping {CHECK_INTERVAL}s")
+        try:
+            check_all_users(force=False)
+        except Exception as e:
+            logger.error(f"Monitor loop error: {e}")
+        logger.info(f"Checked users → sleeping {CHECK_INTERVAL}s")
         time.sleep(CHECK_INTERVAL)
 
 # ================== MAIN ==================
@@ -357,6 +376,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("add", add_user))
     app.add_handler(CommandHandler("remove", remove_user))
     app.add_handler(CommandHandler("list", list_users))
+    app.add_handler(CommandHandler("checknow", checknow))
     app.add_handler(CommandHandler("online", online))
     app.add_handler(MessageHandler(filters.ALL, debug_all))
 
