@@ -13,6 +13,13 @@ from telegram.ext import (
     CommandHandler,
 )
 
+# Optional: Using yt-dlp / tiktok-api-dl logic for profile extraction
+try:
+    import yt_dlp
+    HAS_YTDLP = True
+except ImportError:
+    HAS_YTDLP = False
+
 # ================== CONFIGURATION ==================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
@@ -59,44 +66,65 @@ def save_config():
     except Exception as e:
         logger.error(f"Error saving config: {e}")
 
-# ================== FREE WORKER SCRAPER ENGINE ==================
+# ================== TIKTOK PROFILE SCRAPER ==================
 async def fetch_latest_posts(username: str) -> List[Dict[str, Any]]:
-    """Fetches post details via the Cloudflare Worker API."""
-    target_url = f"https://www.tiktok.com/@{username}"
-    api_endpoint = f"https://tdownv4.sl-bjs.workers.dev/?down={target_url}"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    
+    """
+    1. Checks the user's profile feed for the newest video URL/ID.
+    2. Passes the specific video URL to extract the direct MP4 download link.
+    """
+    clean_user = username.lstrip("@").strip().lower()
+    profile_url = f"https://www.tiktok.com/@{clean_user}"
     posts = []
-    try:
-        async with httpx.AsyncClient(headers=headers, timeout=25.0, follow_redirects=True) as client:
-            res = await client.get(api_endpoint)
-            logger.info(f"Worker API Status for @{username}: {res.status_code}")
-            
-            if res.status_code == 200:
-                data = res.json()
-                
-                video_id = str(data.get("video_id") or "")
-                download_url = data.get("download_url")
-                title = data.get("title") or "New TikTok Video"
-                
-                if video_id:
-                    posts.append({
-                        "id": video_id,
-                        "url": f"https://www.tiktok.com/@{username}/video/{video_id}",
-                        "direct_video_url": download_url,
-                        "title": title
-                    })
-                else:
-                    logger.warning(f"No video_id found in Worker API response for @{username}")
-            else:
-                logger.error(f"Worker API failed with status {res.status_code}: {res.text[:200]}")
-                
-    except Exception as e:
-        logger.error(f"Exception fetching posts via Worker API for @{username}: {e}")
-        
+
+    # Step 1: Use yt-dlp / flat extraction to pull the latest video link from the profile
+    latest_video_url = None
+    latest_video_id = None
+    title = "New TikTok Video"
+
+    if HAS_YTDLP:
+        ydl_opts = {
+            "extract_flat": True,
+            "playlistend": 1,
+            "quiet": True,
+            "no_warnings": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(profile_url, download=False)
+                if info and "entries" in info and len(info["entries"]) > 0:
+                    entry = info["entries"][0]
+                    latest_video_url = entry.get("url")
+                    latest_video_id = str(entry.get("id") or "")
+                    title = entry.get("title") or title
+        except Exception as e:
+            logger.error(f"Error fetching profile feed for @{clean_user} with yt-dlp: {e}")
+
+    # Step 2: Extract direct MP4 download URL for the specific video
+    direct_download_url = None
+    if latest_video_url:
+        # Resolve non-watermarked download link using tiktok-api-dl worker / tdown endpoint
+        downloader_api = f"https://tdownv4.sl-bjs.workers.dev/?down={latest_video_url}"
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                res = await client.get(downloader_api)
+                if res.status_code == 200:
+                    data = res.json()
+                    direct_download_url = data.get("download_url")
+                    if not latest_video_id:
+                        latest_video_id = str(data.get("video_id") or "")
+                    if data.get("title"):
+                        title = data.get("title")
+        except Exception as e:
+            logger.warning(f"Could not extract direct download URL for {latest_video_url}: {e}")
+
+    if latest_video_id or latest_video_url:
+        posts.append({
+            "id": latest_video_id or latest_video_url.split("/")[-1],
+            "url": latest_video_url or f"https://www.tiktok.com/@{clean_user}/video/{latest_video_id}",
+            "direct_video_url": direct_download_url,
+            "title": title
+        })
+
     return posts
 
 # ================== COMMAND HANDLERS ==================
@@ -154,7 +182,7 @@ async def reset_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     config["last_seen"][username] = None
     save_config()
 
-    await update.message.reply_text(f"🔄 Memory cleared for @{username}. Next `/checknow` will detect their current top post as new.")
+    await update.message.reply_text(f"🔄 Memory cleared for @{username}. Next `/checknow` will detect their top post as new.")
 
 async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = config.get("monitored_users", [])
@@ -173,10 +201,10 @@ async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def process_account_check(username: str) -> Dict[str, Any]:
-    """Retrieves posts, compares IDs, and updates state if a new ID is detected."""
+    """Scrapes account feed, checks if the newest post ID is new, and returns status."""
     posts = await fetch_latest_posts(username)
     if not posts:
-        return {"status": "failed", "message": f"❌ <b>@{username}</b>: Couldn't fetch posts."}
+        return {"status": "failed", "message": f"❌ <b>@{username}</b>: Couldn't fetch latest video."}
 
     latest = posts[0]
     fetched_id = latest.get("id")
@@ -185,7 +213,8 @@ async def process_account_check(username: str) -> Dict[str, Any]:
     title = latest.get("title", "")
     last_seen_id = config["last_seen"].get(username)
 
-    if fetched_id == last_seen_id:
+    # ID CHECK: Skip if video ID matches stored memory
+    if fetched_id and fetched_id == last_seen_id:
         return {
             "status": "no_change", 
             "message": f"ℹ️ <b>@{username}</b>: Same video ID (<code>{fetched_id}</code>). Skipped."
@@ -239,7 +268,7 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                             sent = True
                 except Exception as stream_err:
-                    logger.warning(f"Video stream upload failed, falling back to text link: {stream_err}")
+                    logger.warning(f"Video download/upload failed: {stream_err}")
 
             if not sent:
                 await context.bot.send_message(
@@ -248,6 +277,7 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
 
+            # REPLACE OLD ID WITH NEW ID IN STATE AND SAVE
             config["last_seen"][username] = post_id
             save_config()
 
@@ -280,7 +310,7 @@ async def scheduled_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                             )
                             sent = True
                 except Exception as e:
-                    logger.warning(f"Scheduled job video stream failed: {e}")
+                    logger.warning(f"Scheduled video download failed: {e}")
 
             if not sent:
                 await context.bot.send_message(
@@ -289,6 +319,7 @@ async def scheduled_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
 
+            # REPLACE OLD ID WITH NEW ID IN STATE AND SAVE
             config["last_seen"][username] = post_id
             save_config()
 
