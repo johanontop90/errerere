@@ -16,7 +16,6 @@ from telegram.ext import (
 # ================== CONFIGURATION ==================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "5e0accb80dmshac265d29cc278d6p1913fdjsn02f9fb70c725")
 CONFIG_FILE = "config.json"
 CHECK_INTERVAL = 300  # 5 minutes
 
@@ -60,86 +59,43 @@ def save_config():
     except Exception as e:
         logger.error(f"Error saving config: {e}")
 
-# ================== RAPIDAPI SCRAPER ENGINE ==================
+# ================== FREE WORKER SCRAPER ENGINE ==================
 async def fetch_latest_posts(username: str) -> List[Dict[str, Any]]:
-    """Fetches user posts using Realtime Tiktok Data Scraper via RapidAPI."""
-    url = "https://realtime-tiktok-data-scraper.p.rapidapi.com/get_collection_by_user.php"
+    """Fetches post details via the Cloudflare Worker API."""
+    target_url = f"https://www.tiktok.com/@{username}"
+    api_endpoint = f"https://tdownv4.sl-bjs.workers.dev/?down={target_url}"
     
     headers = {
-        "x-rapidapi-host": "realtime-tiktok-data-scraper.p.rapidapi.com",
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "Content-Type": "application/json"
-    }
-    
-    params = {
-        "unique_id": username.lstrip("@"),
-        "count": "5",
-        "cursor": "0"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
     posts = []
     try:
-        async with httpx.AsyncClient(headers=headers, timeout=20.0) as client:
-            res = await client.get(url, params=params)
-            logger.info(f"RapidAPI Response Status for @{username}: {res.status_code}")
+        async with httpx.AsyncClient(headers=headers, timeout=25.0, follow_redirects=True) as client:
+            res = await client.get(api_endpoint)
+            logger.info(f"Worker API Status for @{username}: {res.status_code}")
             
             if res.status_code == 200:
                 data = res.json()
                 
-                # Unpack response items dynamically across different potential schemas
-                items = []
-                if isinstance(data, list):
-                    items = data
-                elif isinstance(data, dict):
-                    if "data" in data and isinstance(data["data"], list):
-                        items = data["data"]
-                    elif "data" in data and isinstance(data["data"], dict):
-                        items = data["data"].get("videos") or data["data"].get("itemList") or data["data"].get("aweme_list") or []
-                    else:
-                        items = data.get("aweme_list") or data.get("itemList") or data.get("videos") or []
-
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-
-                    # Extract video ID
-                    video_id = str(
-                        item.get("aweme_id") or 
-                        item.get("id") or 
-                        item.get("video_id") or 
-                        item.get("item_id") or ""
-                    )
-                    
-                    # Extract direct play URL
-                    play_url = None
-                    video_info = item.get("video")
-                    if isinstance(video_info, dict):
-                        play_addr = video_info.get("play_addr") or video_info.get("download_addr")
-                        if isinstance(play_addr, dict):
-                            urls = play_addr.get("url_list", [])
-                            if urls:
-                                play_url = urls[0]
-                        elif isinstance(video_info.get("play_addr"), str):
-                            play_url = video_info.get("play_addr")
-                            
-                    if not play_url:
-                        play_url = item.get("play") or item.get("video_url") or item.get("direct_url")
-
-                    # Extract title / description
-                    title = item.get("desc") or item.get("title") or "New TikTok Video"
-
-                    if video_id:
-                        posts.append({
-                            "id": video_id,
-                            "url": f"https://www.tiktok.com/@{username}/video/{video_id}",
-                            "direct_video_url": play_url,
-                            "title": title
-                        })
+                video_id = str(data.get("video_id") or "")
+                download_url = data.get("download_url")
+                title = data.get("title") or "New TikTok Video"
+                
+                if video_id:
+                    posts.append({
+                        "id": video_id,
+                        "url": f"https://www.tiktok.com/@{username}/video/{video_id}",
+                        "direct_video_url": download_url,
+                        "title": title
+                    })
+                else:
+                    logger.warning(f"No video_id found in Worker API response for @{username}")
             else:
-                logger.error(f"RapidAPI request failed ({res.status_code}): {res.text[:200]}")
+                logger.error(f"Worker API failed with status {res.status_code}: {res.text[:200]}")
                 
     except Exception as e:
-        logger.error(f"Error fetching posts via RapidAPI for @{username}: {e}")
+        logger.error(f"Exception fetching posts via Worker API for @{username}: {e}")
         
     return posts
 
@@ -150,7 +106,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Available Commands:</b>\n"
         "• /add &lt;username&gt; – Add user to monitoring list\n"
         "• /remove &lt;username&gt; – Remove user from monitoring list\n"
-        "• /reset &lt;username&gt; – Clear video memory for user\n"
+        "• /reset &lt;username&gt; – Clear stored video ID for user\n"
         "• /list – List monitored accounts\n"
         "• /checknow – Run manual account scan\n"
         "• /online – Show bot uptime"
@@ -164,14 +120,14 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     username = context.args[0].lstrip("@").lower().strip()
     if username in config["monitored_users"]:
-        await update.message.reply_text(f"ℹ️ @{username} is already being monitored.")
+        await update.message.reply_text(f"ℹ️ @{username} is already monitored.")
         return
 
     config["monitored_users"].append(username)
     config["last_seen"][username] = None
     save_config()
 
-    await update.message.reply_text(f"✅ Added @{username} to the monitoring list.")
+    await update.message.reply_text(f"✅ Added @{username}. Run `/checknow` to fetch their latest post.")
 
 async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -187,7 +143,7 @@ async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     config["last_seen"].pop(username, None)
     save_config()
 
-    await update.message.reply_text(f"✅ Removed @{username} from the monitoring list.")
+    await update.message.reply_text(f"✅ Removed @{username} from monitoring.")
 
 async def reset_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -198,18 +154,18 @@ async def reset_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     config["last_seen"][username] = None
     save_config()
 
-    await update.message.reply_text(f"🔄 Memory cleared for @{username}. Next `/checknow` will resend their top video.")
+    await update.message.reply_text(f"🔄 Memory cleared for @{username}. Next `/checknow` will detect their current top post as new.")
 
 async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = config.get("monitored_users", [])
     if not users:
-        await update.message.reply_text("📋 No accounts are currently monitored.")
+        await update.message.reply_text("📋 No accounts monitored.")
         return
 
     formatted_list = []
     for u in users:
-        last = config["last_seen"].get(u) or "None"
-        formatted_list.append(f"• @{u} (Last ID: <code>{last}</code>)")
+        last = config["last_seen"].get(u) or "None (Cleared)"
+        formatted_list.append(f"• @{u} (Stored ID: <code>{last}</code>)")
 
     await update.message.reply_text(
         f"📋 <b>Monitored Accounts ({len(users)}):</b>\n\n" + "\n".join(formatted_list),
@@ -217,25 +173,28 @@ async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def process_account_check(username: str) -> Dict[str, Any]:
-    """Helper function to run scan on single user and update state."""
+    """Retrieves posts, compares IDs, and updates state if a new ID is detected."""
     posts = await fetch_latest_posts(username)
     if not posts:
-        return {"status": "failed", "message": f"❌ <b>@{username}</b>: Couldn't fetch feed (Private/Not indexing)."}
+        return {"status": "failed", "message": f"❌ <b>@{username}</b>: Couldn't fetch posts."}
 
     latest = posts[0]
-    post_id = latest.get("id")
+    fetched_id = latest.get("id")
     post_url = latest.get("url")
     direct_url = latest.get("direct_video_url")
     title = latest.get("title", "")
-    last_seen = config["last_seen"].get(username)
+    last_seen_id = config["last_seen"].get(username)
 
-    if post_id == last_seen:
-        return {"status": "no_change", "message": f"ℹ️ <b>@{username}</b>: Up to date (Latest ID: <code>{post_id}</code>)"}
+    if fetched_id == last_seen_id:
+        return {
+            "status": "no_change", 
+            "message": f"ℹ️ <b>@{username}</b>: Same video ID (<code>{fetched_id}</code>). Skipped."
+        }
 
     return {
         "status": "new_post",
-        "message": f"🆕 <b>@{username}</b>: <b>NEW POST DETECTED!</b> (ID: <code>{post_id}</code>)",
-        "post_id": post_id,
+        "message": f"🆕 <b>@{username}</b>: New post detected! (ID: <code>{fetched_id}</code>)",
+        "post_id": fetched_id,
         "post_url": post_url,
         "direct_url": direct_url,
         "title": title
@@ -244,11 +203,11 @@ async def process_account_check(username: str) -> Dict[str, Any]:
 async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = list(config.get("monitored_users", []))
     if not users:
-        await update.message.reply_text("📋 No accounts in list. Add one using <code>/add username</code>", parse_mode="HTML")
+        await update.message.reply_text("📋 No accounts in list. Add one with <code>/add username</code>", parse_mode="HTML")
         return
 
     status_msg = await update.message.reply_text("⏳ <b>Starting live scan...</b>", parse_mode="HTML")
-    logs = ["🔍 <b>Live Account Check Progress:</b>\n"]
+    logs = ["🔍 <b>Live Scan Progress:</b>\n"]
     found_total = 0
 
     for idx, username in enumerate(users, start=1):
@@ -260,6 +219,7 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if res["status"] == "new_post":
             found_total += 1
+            post_id = res["post_id"]
             post_url = res["post_url"]
             direct_url = res["direct_url"]
             title = res["title"]
@@ -279,7 +239,7 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                             sent = True
                 except Exception as stream_err:
-                    logger.warning(f"Failed sending video stream to Telegram: {stream_err}")
+                    logger.warning(f"Video stream upload failed, falling back to text link: {stream_err}")
 
             if not sent:
                 await context.bot.send_message(
@@ -288,18 +248,19 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
 
-            config["last_seen"][username] = res["post_id"]
+            config["last_seen"][username] = post_id
             save_config()
 
-    logs.append(f"\n🏁 <b>Scan complete.</b> Found {found_total} new post(s).")
+    logs.append(f"\n🏁 <b>Scan complete.</b> Discovered {found_total} new post(s).")
     await status_msg.edit_text("\n".join(logs), parse_mode="HTML")
 
 async def scheduled_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    """Background polling function."""
+    """Automatic background polling task."""
     users = list(config.get("monitored_users", []))
     for username in users:
         res = await process_account_check(username)
         if res["status"] == "new_post":
+            post_id = res["post_id"]
             post_url = res["post_url"]
             direct_url = res["direct_url"]
             title = res["title"]
@@ -319,7 +280,7 @@ async def scheduled_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                             )
                             sent = True
                 except Exception as e:
-                    logger.warning(f"Scheduled job video error: {e}")
+                    logger.warning(f"Scheduled job video stream failed: {e}")
 
             if not sent:
                 await context.bot.send_message(
@@ -328,7 +289,7 @@ async def scheduled_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
 
-            config["last_seen"][username] = res["post_id"]
+            config["last_seen"][username] = post_id
             save_config()
 
 async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
