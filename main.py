@@ -4,17 +4,17 @@ import time
 import threading
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import requests
-from telegram import Update
+from telegram import Update, InputMediaPhoto
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 # ================== CONFIG ==================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
 CONFIG_FILE = "config.json"
-CHECK_INTERVAL = 300
+CHECK_INTERVAL = 300  # 5 minutes
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
@@ -59,7 +59,7 @@ def save_config():
         except Exception as e:
             logger.error(f"Error saving config: {e}")
 
-# ================== TIKTOK (same as before) ==================
+# ================== TIKTOK ==================
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
     "Accept": "application/json, text/plain, */*",
@@ -105,19 +105,30 @@ def get_latest_posts(username: str, count: int = 5) -> List[Dict]:
         logger.warning(f"Posts error @{username}: {e}")
     return []
 
-def get_media_info(item: Dict) -> tuple[Optional[str], Optional[str]]:
+def extract_all_media(item: Dict) -> Tuple[List[str], Optional[str]]:
+    """
+    Returns:
+        photos: list of photo URLs
+        video: video URL (or None)
+    """
+    photos = []
+    video_url = None
+
+    # Check for video
     video = item.get("video") or {}
     play_addr = video.get("playAddr") or video.get("downloadAddr")
     if play_addr:
-        return play_addr, "video"
+        video_url = play_addr
 
+    # Check for image post (carousel)
     image_post = item.get("imagePost") or {}
     images = image_post.get("images") or []
-    if images:
-        url_list = images[0].get("imageURL", {}).get("urlList") or []
+    for img in images:
+        url_list = img.get("imageURL", {}).get("urlList") or []
         if url_list:
-            return url_list[0], "photo"
-    return None, None
+            photos.append(url_list[0])  # highest quality usually first
+
+    return photos, video_url
 
 # ================== COMMANDS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,11 +214,79 @@ async def online(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-# Catch-all for debugging
 async def debug_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"DEBUG - Received message: {update.message.text if update.message else 'No text'} from user {update.effective_user.id}")
+    if update.message and update.message.text:
+        logger.info(f"DEBUG - Received: {update.message.text} from {update.effective_user.id}")
 
 # ================== MONITORING ==================
+def send_telegram_message(text: str):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={
+                "chat_id": ALERT_CHAT_ID,
+                "text": text,
+                "disable_web_page_preview": False
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        logger.error(f"Failed to send message: {e}")
+
+def send_video(video_url: str, caption: str):
+    try:
+        r = requests.get(video_url, headers=HEADERS, timeout=30)
+        if r.status_code == 200 and len(r.content) > 1000:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo",
+                data={"chat_id": ALERT_CHAT_ID, "caption": caption},
+                files={"video": ("video.mp4", r.content)},
+                timeout=90,
+            )
+            return True
+    except Exception as e:
+        logger.warning(f"Failed to send video: {e}")
+    return False
+
+def send_photos(photo_urls: List[str], caption: str):
+    """Send multiple photos as a media group"""
+    if not photo_urls:
+        return False
+
+    try:
+        media = []
+        files = {}
+
+        for i, url in enumerate(photo_urls[:10]):  # Telegram limit is 10
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            if r.status_code == 200:
+                file_name = f"photo{i}.jpg"
+                files[file_name] = r.content
+                media.append({
+                    "type": "photo",
+                    "media": f"attach://{file_name}",
+                    "caption": caption if i == 0 else ""
+                })
+
+        if not media:
+            return False
+
+        data = {
+            "chat_id": ALERT_CHAT_ID,
+            "media": json.dumps(media)
+        }
+
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup",
+            data=data,
+            files=files,
+            timeout=60,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to send photos: {e}")
+        return False
+
 def monitor_loop():
     logger.info("Monitoring thread started")
     while True:
@@ -236,42 +315,20 @@ def monitor_loop():
                     f"https://www.tiktok.com/@{username}/video/{post_id}"
                 )
 
-                media_url, media_type = get_media_info(latest)
+                photos, video_url = extract_all_media(latest)
                 sent = False
 
-                if media_url:
-                    try:
-                        r = requests.get(media_url, headers=HEADERS, timeout=20)
-                        if r.status_code == 200 and len(r.content) > 1000:
-                            if media_type == "video":
-                                requests.post(
-                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo",
-                                    data={"chat_id": ALERT_CHAT_ID, "caption": caption},
-                                    files={"video": ("video.mp4", r.content)},
-                                    timeout=60,
-                                )
-                                sent = True
-                            elif media_type == "photo":
-                                requests.post(
-                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                                    data={"chat_id": ALERT_CHAT_ID, "caption": caption},
-                                    files={"photo": ("photo.jpg", r.content)},
-                                    timeout=30,
-                                )
-                                sent = True
-                    except Exception as e:
-                        logger.warning(f"Media send failed @{username}: {e}")
+                # Prefer video if exists
+                if video_url:
+                    sent = send_video(video_url, caption)
 
+                # Otherwise send all photos
+                elif photos:
+                    sent = send_photos(photos, caption)
+
+                # Fallback to just the link
                 if not sent:
-                    requests.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                        data={
-                            "chat_id": ALERT_CHAT_ID,
-                            "text": caption,
-                            "disable_web_page_preview": False
-                        },
-                        timeout=15,
-                    )
+                    send_telegram_message(caption)
 
                 with config_lock:
                     config["last_seen"][username] = post_id
@@ -299,9 +356,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("remove", remove_user))
     app.add_handler(CommandHandler("list", list_users))
     app.add_handler(CommandHandler("online", online))
-
-    # This will catch everything else for debugging
     app.add_handler(MessageHandler(filters.ALL, debug_all))
 
-    logger.info("Bot is running (DEBUG MODE)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot is running...")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
