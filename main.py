@@ -1,26 +1,29 @@
 import os
 import json
 import time
-import threading
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
-import requests
+import httpx
 import yt_dlp
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
-# ================== CONFIG ==================
+# ================== CONFIGURATION ==================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
 CONFIG_FILE = "config.json"
-CHECK_INTERVAL = 300  # 5 minutes
+CHECK_INTERVAL = 300  # 5 minutes in seconds
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-if not ALERT_CHAT_ID:
-    raise RuntimeError("Missing ALERT_CHAT_ID")
+if not TELEGRAM_BOT_TOKEN or not ALERT_CHAT_ID:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or ALERT_CHAT_ID environment variables.")
 
 try:
     ALERT_CHAT_ID = int(ALERT_CHAT_ID)
@@ -28,12 +31,12 @@ except ValueError:
     pass
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("TikTokMonitorBot")
 
-config_lock = threading.Lock()
+# ================== STATE MANAGEMENT ==================
 config: Dict[str, Any] = {
     "monitored_users": [],
     "last_seen": {}
@@ -42,306 +45,245 @@ config: Dict[str, Any] = {
 def load_config():
     global config
     try:
-        with open(CONFIG_FILE, "r") as f:
-            loaded = json.load(f)
-            with config_lock:
-                config = loaded
-        logger.info(f"Loaded {len(config.get('monitored_users', []))} monitored users")
-    except FileNotFoundError:
-        save_config()
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            logger.info(f"Loaded {len(config.get('monitored_users', []))} monitored users.")
+        else:
+            save_config()
     except Exception as e:
         logger.error(f"Error loading config: {e}")
 
 def save_config():
-    with config_lock:
-        try:
-            with open(CONFIG_FILE, "w") as f:
-                json.dump(config, f, indent=2)
-            logger.info("Config saved successfully")
-        except Exception as e:
-            logger.error(f"Error saving config: {e}")
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        logger.info("Config saved successfully.")
+    except Exception as e:
+        logger.error(f"Error saving config: {e}")
 
-# ================== TIKTOK VIA YT-DLP ==================
+# ================== TIKTOK SCRAPER (YT-DLP) ==================
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
 }
 
-def get_latest_posts(username: str, max_results: int = 3) -> List[Dict]:
-    """Fetch the latest posts for a TikTok user using yt-dlp."""
+def fetch_latest_posts(username: str, max_results: int = 3) -> List[Dict[str, Any]]:
+    """Fetch recent posts for a TikTok user using yt-dlp."""
     profile_url = f"https://www.tiktok.com/@{username}"
-    
     ydl_opts = {
-        'extract_flat': True,
-        'playlistend': max_results,
-        'quiet': True,
-        'no_warnings': True,
-        'ignoreerrors': True,
+        "extract_flat": True,
+        "playlistend": max_results,
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "http_headers": HEADERS,
     }
 
     posts = []
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             result = ydl.extract_info(profile_url, download=False)
-            if result and 'entries' in result:
-                for entry in result['entries']:
+            if result and "entries" in result:
+                for entry in result["entries"]:
                     if entry:
                         posts.append({
-                            "id": entry.get("id"),
+                            "id": str(entry.get("id")),
                             "url": entry.get("url") or f"https://www.tiktok.com/@{username}/video/{entry.get('id')}",
-                            "title": entry.get("title") or ""
+                            "title": entry.get("title") or "New TikTok Video"
                         })
     except Exception as e:
-        logger.error(f"yt-dlp failed to fetch @{username}: {e}")
-    
+        logger.error(f"yt-dlp failed to fetch profile for @{username}: {e}")
+
     return posts
 
-def get_direct_video_url(post_url: str) -> Optional[str]:
-    """Extract a direct playable MP4 link from a specific post URL."""
+def get_direct_video_stream(post_url: str) -> Optional[str]:
+    """Extract direct playable MP4 stream URL."""
     ydl_opts = {
-        'format': 'best',
-        'quiet': True,
-        'no_warnings': True,
+        "format": "b[ext=mp4]/best[ext=mp4]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "http_headers": HEADERS,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(post_url, download=False)
-            return info.get('url')
+            return info.get("url")
     except Exception as e:
-        logger.warning(f"Failed to get direct video URL for {post_url}: {e}")
+        logger.warning(f"Failed to extract video stream for {post_url}: {e}")
         return None
 
-# ================== SENDING ==================
-def send_telegram_message(text: str):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={
-                "chat_id": ALERT_CHAT_ID,
-                "text": text,
-                "disable_web_page_preview": False
-            },
-            timeout=15,
-        )
-    except Exception as e:
-        logger.error(f"Failed to send message: {e}")
-
-def send_video(video_url: str, caption: str) -> bool:
-    try:
-        r = requests.get(video_url, headers=HEADERS, timeout=30, stream=True)
-        if r.status_code == 200:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo",
-                data={"chat_id": ALERT_CHAT_ID, "caption": caption},
-                files={"video": ("video.mp4", r.raw)},
-                timeout=90,
-            )
-            return True
-    except Exception as e:
-        logger.warning(f"Failed to send video: {e}")
-    return False
-
-# ================== CHECK LOGIC ==================
-def check_all_users(force: bool = False) -> int:
-    found = 0
-    with config_lock:
-        users = list(config.get("monitored_users", []))
+# ================== ASYNC MONITOR TASK ==================
+async def check_all_users(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> int:
+    """Checks all users in the monitoring list for new posts."""
+    users = list(config.get("monitored_users", []))
+    found_count = 0
 
     for username in users:
         try:
-            posts = get_latest_posts(username, max_results=3)
+            # Offload synchronous yt-dlp extraction to async loop executor
+            loop = context.application.loop
+            posts = await loop.run_in_executor(None, fetch_latest_posts, username, 3)
+
             if not posts:
-                logger.info(f"No posts found or scraping blocked for @{username}")
+                logger.info(f"No posts retrieved for @{username} (Profile private or blocked).")
                 continue
 
             latest = posts[0]
-            post_id = str(latest.get("id") or "")
+            post_id = latest.get("id")
             post_url = latest.get("url")
+            last_seen = config["last_seen"].get(username)
 
-            with config_lock:
-                last_seen = config["last_seen"].get(username)
-
-            if not post_id:
+            if not post_id or (not force and post_id == last_seen):
                 continue
 
-            if not force and post_id == last_seen:
-                continue
+            logger.info(f"New post detected for @{username}: {post_id}")
+            caption = f"🆕 <b>New post from @{username}</b>\n\n{post_url}"
 
-            logger.info(f"{'Force check' if force else 'New post'} from @{username}: {post_id}")
+            # Attempt to download video and send directly via Telegram Bot API
+            direct_url = await loop.run_in_executor(None, get_direct_video_stream, post_url)
+            sent_successfully = False
 
-            caption = (
-                f"🆕 New post from @{username}\n\n"
-                f"{post_url}"
-            )
-
-            direct_url = get_direct_video_url(post_url)
-            sent = False
             if direct_url:
-                sent = send_video(direct_url, caption)
+                try:
+                    async with httpx.AsyncClient(headers=HEADERS, timeout=60.0) as client:
+                        response = await client.get(direct_url)
+                        if response.status_code == 200:
+                            await context.bot.send_video(
+                                chat_id=ALERT_CHAT_ID,
+                                video=response.content,
+                                caption=caption,
+                                parse_mode="HTML"
+                            )
+                            sent_successfully = True
+                except Exception as stream_err:
+                    logger.warning(f"Failed sending video stream to Telegram: {stream_err}")
 
-            if not sent:
-                send_telegram_message(caption)
+            # Fallback to plain text alert with video link if media delivery fails
+            if not sent_successfully:
+                await context.bot.send_message(
+                    chat_id=ALERT_CHAT_ID,
+                    text=caption,
+                    parse_mode="HTML",
+                    disable_web_page_preview=False
+                )
 
-            with config_lock:
-                config["last_seen"][username] = post_id
-                save_config()
+            # Update state
+            config["last_seen"][username] = post_id
+            save_config()
+            found_count += 1
 
-            found += 1
+        except Exception as err:
+            logger.error(f"Error checking user @{username}: {err}")
 
-        except Exception as e:
-            logger.error(f"Error processing @{username}: {e}")
+    return found_count
 
-    return found
+async def scheduled_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job queue task run periodically."""
+    await check_all_users(context, force=False)
 
-# ================== COMMANDS ==================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /start from {update.effective_user.id}")
-    await update.message.reply_text(
+# ================== COMMAND HANDLERS ==================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome = (
         "👋 <b>TikTok Monitor Bot</b>\n\n"
-        "Commands:\n"
-        "/add &lt;username&gt; – start monitoring\n"
-        "/remove &lt;username&gt; – stop monitoring\n"
-        "/list – show monitored users\n"
-        "/checknow – force check for new posts right now\n"
-        "/online – bot uptime\n"
-        "/help",
+        "<b>Available Commands:</b>\n"
+        "• /add &lt;username&gt; – Add user to monitoring list\n"
+        "• /remove &lt;username&gt; – Remove user from monitoring list\n"
+        "• /list – List all monitored accounts\n"
+        "• /checknow – Force immediate scan\n"
+        "• /online – Show bot uptime"
+    )
+    await update.message.reply_text(welcome, parse_mode="HTML")
+
+async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: <code>/add username</code>", parse_mode="HTML")
+        return
+
+    username = context.args[0].lstrip("@").lower().strip()
+    if username in config["monitored_users"]:
+        await update.message.reply_text(f"ℹ️ @{username} is already being monitored.")
+        return
+
+    config["monitored_users"].append(username)
+    config["last_seen"][username] = None
+    save_config()
+
+    await update.message.reply_text(f"✅ Added @{username} to the monitoring list.")
+
+async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: <code>/remove username</code>", parse_mode="HTML")
+        return
+
+    username = context.args[0].lstrip("@").lower().strip()
+    if username not in config["monitored_users"]:
+        await update.message.reply_text(f"ℹ️ @{username} is not in the list.")
+        return
+
+    config["monitored_users"].remove(username)
+    config["last_seen"].pop(username, None)
+    save_config()
+
+    await update.message.reply_text(f"✅ Removed @{username} from the monitoring list.")
+
+async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = config.get("monitored_users", [])
+    if not users:
+        await update.message.reply_text("📋 No accounts are currently monitored.")
+        return
+
+    formatted_list = "\n".join([f"• @{u}" for u in users])
+    await update.message.reply_text(
+        f"📋 <b>Monitored Accounts ({len(users)}):</b>\n\n{formatted_list}",
         parse_mode="HTML"
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
+async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Checking all monitored accounts now...")
+    found = await check_all_users(context, force=False)
+    await update.message.reply_text(f"✅ Scan completed! Found {found} new post(s).")
 
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /add from {update.effective_user.id}")
-    if not context.args:
-        await update.message.reply_text("Usage: /add username")
-        return
-
-    username = context.args[0].lstrip("@").lower().strip()
-    if not username:
-        await update.message.reply_text("Invalid username")
-        return
-
-    try:
-        with config_lock:
-            if username in config["monitored_users"]:
-                await update.message.reply_text(f"@{username} is already being monitored.")
-                return
-            config["monitored_users"].append(username)
-            config["last_seen"][username] = None
-
-        save_config()
-        await update.message.reply_text(f"✅ Now monitoring @{username}")
-    except Exception as e:
-        logger.error(f"Error in /add: {e}")
-        await update.message.reply_text(f"❌ Failed to add @{username}. Error: {e}")
-
-async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /remove from {update.effective_user.id}")
-    if not context.args:
-        await update.message.reply_text("Usage: /remove username")
-        return
-
-    username = context.args[0].lstrip("@").lower().strip()
-
-    try:
-        with config_lock:
-            if username not in config["monitored_users"]:
-                await update.message.reply_text(f"@{username} is not being monitored.")
-                return
-            config["monitored_users"].remove(username)
-            config["last_seen"].pop(username, None)
-
-        save_config()
-        await update.message.reply_text(f"✅ Removed @{username}")
-    except Exception as e:
-        logger.error(f"Error in /remove: {e}")
-        await update.message.reply_text(f"❌ Failed to remove @{username}. Error: {e}")
-
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /list from {update.effective_user.id}")
-    with config_lock:
-        users = config.get("monitored_users", [])
-
-    if not users:
-        await update.message.reply_text("📋 No users are currently being monitored.")
-        return
-
-    text = "📋 <b>Monitored Users</b>\n\n" + "\n".join(f"• @{u}" for u in users)
-    await update.message.reply_text(text, parse_mode="HTML")
-
-async def checknow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /checknow from {update.effective_user.id}")
-    await update.message.reply_text("🔍 Checking for new posts right now...")
-
-    def run_check():
-        found = check_all_users(force=False)
-        if found == 0:
-            send_telegram_message("✅ No new posts found.")
-        else:
-            send_telegram_message(f"✅ Found and sent {found} new post(s).")
-
-    threading.Thread(target=run_check, daemon=True).start()
-
-async def online(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /online from {update.effective_user.id}")
+async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_ts = float(os.environ.get("START_TIME", time.time()))
     start_time = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-    now = datetime.now(timezone.utc)
-    delta = now - start_time
+    uptime = datetime.now(timezone.utc) - start_time
 
-    days = delta.days
-    hours, rem = divmod(delta.seconds, 3600)
-    minutes, seconds = divmod(rem, 60)
+    days = uptime.days
+    hours, remainder = divmod(uptime.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
 
     await update.message.reply_text(
-        f"⏱ Uptime: <b>{days}d {hours}h {minutes}m {seconds}s</b>",
+        f"⏱ <b>Bot Uptime:</b> {days}d {hours}h {minutes}m {seconds}s",
         parse_mode="HTML"
     )
 
-async def debug_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.text:
-        logger.info(f"DEBUG - Received: {update.message.text} from {update.effective_user.id}")
-
-# ================== MONITORING LOOP ==================
-def monitor_loop():
-    logger.info("Monitoring thread started")
-    while True:
-        try:
-            check_all_users(force=False)
-        except Exception as e:
-            logger.error(f"Monitor loop error: {e}")
-        logger.info(f"Checked users → sleeping {CHECK_INTERVAL}s")
-        time.sleep(CHECK_INTERVAL)
-
-# ================== MAIN ==================
+# ================== MAIN ENTRY POINT ==================
 if __name__ == "__main__":
     os.environ["START_TIME"] = str(time.time())
     load_config()
 
-    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-    monitor_thread.start()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
-        .write_timeout(30.0)
-        .pool_timeout(30.0)
-        .build()
-    )
+    # Commands
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", start_command))
+    app.add_handler(CommandHandler("add", add_user_command))
+    app.add_handler(CommandHandler("remove", remove_user_command))
+    app.add_handler(CommandHandler("list", list_users_command))
+    app.add_handler(CommandHandler("checknow", checknow_command))
+    app.add_handler(CommandHandler("online", online_command))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("add", add_user))
-    app.add_handler(CommandHandler("remove", remove_user))
-    app.add_handler(CommandHandler("list", list_users))
-    app.add_handler(CommandHandler("checknow", checknow))
-    app.add_handler(CommandHandler("online", online))
-    app.add_handler(MessageHandler(filters.ALL, debug_all))
+    # Add periodic background task using JobQueue
+    if app.job_queue:
+        app.job_queue.run_repeating(
+            scheduled_monitor_job,
+            interval=CHECK_INTERVAL,
+            first=10
+        )
 
-    logger.info("Bot is running...")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
+    logger.info("Bot starting up...")
+    app.run_polling(drop_pending_updates=True)
