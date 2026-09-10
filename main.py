@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
@@ -13,7 +14,6 @@ from telegram.ext import (
     CommandHandler,
 )
 
-# Optional: Using yt-dlp / tiktok-api-dl logic for profile extraction
 try:
     import yt_dlp
     HAS_YTDLP = True
@@ -67,28 +67,35 @@ def save_config():
         logger.error(f"Error saving config: {e}")
 
 # ================== TIKTOK PROFILE SCRAPER ==================
-async def fetch_latest_posts(username: str) -> List[Dict[str, Any]]:
+async def fetch_latest_posts(username: str, status_callback=None) -> List[Dict[str, Any]]:
     """
-    1. Checks the user's profile feed for the newest video URL/ID.
-    2. Passes the specific video URL to extract the direct MP4 download link.
+    1. Connects to TikTok profile to extract the newest video URL & ID.
+    2. Resolves the direct download link via worker/API.
     """
     clean_user = username.lstrip("@").strip().lower()
     profile_url = f"https://www.tiktok.com/@{clean_user}"
     posts = []
 
-    # Step 1: Use yt-dlp / flat extraction to pull the latest video link from the profile
     latest_video_url = None
     latest_video_id = None
     title = "New TikTok Video"
 
+    if status_callback:
+        await status_callback(f"🌐 Fetching feed for @{clean_user}...")
+
+    # Strategy A: Use yt-dlp to extract latest post
     if HAS_YTDLP:
         ydl_opts = {
             "extract_flat": True,
             "playlistend": 1,
             "quiet": True,
             "no_warnings": True,
+            "headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
         }
         try:
+            logger.info(f"Running yt-dlp profile check for @{clean_user}...")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(profile_url, download=False)
                 if info and "entries" in info and len(info["entries"]) > 0:
@@ -96,13 +103,36 @@ async def fetch_latest_posts(username: str) -> List[Dict[str, Any]]:
                     latest_video_url = entry.get("url")
                     latest_video_id = str(entry.get("id") or "")
                     title = entry.get("title") or title
+                    logger.info(f"yt-dlp found post ID: {latest_video_id} for @{clean_user}")
         except Exception as e:
-            logger.error(f"Error fetching profile feed for @{clean_user} with yt-dlp: {e}")
+            logger.error(f"yt-dlp extraction failed for @{clean_user}: {e}")
 
-    # Step 2: Extract direct MP4 download URL for the specific video
+    # Strategy B: Fallback direct HTTP scraper if yt-dlp returns nothing
+    if not latest_video_id:
+        if status_callback:
+            await status_callback(f"🔎 Parsing raw profile page for @{clean_user}...")
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            async with httpx.AsyncClient(headers=headers, timeout=15.0, follow_redirects=True) as client:
+                res = await client.get(profile_url)
+                if res.status_code == 200:
+                    # Match video ID pattern inside raw HTML
+                    matches = re.findall(r'/video/(\d+)', res.text)
+                    if matches:
+                        latest_video_id = matches[0]
+                        latest_video_url = f"https://www.tiktok.com/@{clean_user}/video/{latest_video_id}"
+                        logger.info(f"HTTP regex found video ID: {latest_video_id} for @{clean_user}")
+        except Exception as e:
+            logger.error(f"HTTP fallback scraper failed for @{clean_user}: {e}")
+
+    # Step 2: Extract direct MP4 video link using the specific video URL
     direct_download_url = None
     if latest_video_url:
-        # Resolve non-watermarked download link using tiktok-api-dl worker / tdown endpoint
+        if status_callback:
+            await status_callback(f"⚡ Extracting direct video link for ID {latest_video_id}...")
+            
         downloader_api = f"https://tdownv4.sl-bjs.workers.dev/?down={latest_video_url}"
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
@@ -115,7 +145,7 @@ async def fetch_latest_posts(username: str) -> List[Dict[str, Any]]:
                     if data.get("title"):
                         title = data.get("title")
         except Exception as e:
-            logger.warning(f"Could not extract direct download URL for {latest_video_url}: {e}")
+            logger.warning(f"Could not resolve direct download URL via Worker: {e}")
 
     if latest_video_id or latest_video_url:
         posts.append({
@@ -182,7 +212,7 @@ async def reset_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     config["last_seen"][username] = None
     save_config()
 
-    await update.message.reply_text(f"🔄 Memory cleared for @{username}. Next `/checknow` will detect their top post as new.")
+    await update.message.reply_text(f"🔄 Memory cleared for @{username}. Next `/checknow` will detect their current post as new.")
 
 async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = config.get("monitored_users", [])
@@ -200,11 +230,10 @@ async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="HTML"
     )
 
-async def process_account_check(username: str) -> Dict[str, Any]:
-    """Scrapes account feed, checks if the newest post ID is new, and returns status."""
-    posts = await fetch_latest_posts(username)
+async def process_account_check(username: str, status_callback=None) -> Dict[str, Any]:
+    posts = await fetch_latest_posts(username, status_callback=status_callback)
     if not posts:
-        return {"status": "failed", "message": f"❌ <b>@{username}</b>: Couldn't fetch latest video."}
+        return {"status": "failed", "message": f"❌ <b>@{username}</b>: Couldn't fetch latest video (Profile private/blocked)."}
 
     latest = posts[0]
     fetched_id = latest.get("id")
@@ -213,11 +242,10 @@ async def process_account_check(username: str) -> Dict[str, Any]:
     title = latest.get("title", "")
     last_seen_id = config["last_seen"].get(username)
 
-    # ID CHECK: Skip if video ID matches stored memory
     if fetched_id and fetched_id == last_seen_id:
         return {
             "status": "no_change", 
-            "message": f"ℹ️ <b>@{username}</b>: Same video ID (<code>{fetched_id}</code>). Skipped."
+            "message": f"ℹ️ <b>@{username}</b>: Up to date. Latest ID: <code>{fetched_id}</code>"
         }
 
     return {
@@ -235,15 +263,19 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📋 No accounts in list. Add one with <code>/add username</code>", parse_mode="HTML")
         return
 
-    status_msg = await update.message.reply_text("⏳ <b>Starting live scan...</b>", parse_mode="HTML")
+    status_msg = await update.message.reply_text("⏳ <b>Initializing scan engine...</b>", parse_mode="HTML")
     logs = ["🔍 <b>Live Scan Progress:</b>\n"]
     found_total = 0
 
     for idx, username in enumerate(users, start=1):
-        current_status = f"🔄 Checking [{idx}/{len(users)}]: <b>@{username}</b>..."
-        await status_msg.edit_text("\n".join(logs + [current_status]), parse_mode="HTML")
+        async def update_status(step_text: str):
+            current = f"🔄 [{idx}/{len(users)}] <b>@{username}</b>: {step_text}"
+            try:
+                await status_msg.edit_text("\n".join(logs + [current]), parse_mode="HTML")
+            except Exception:
+                pass
 
-        res = await process_account_check(username)
+        res = await process_account_check(username, status_callback=update_status)
         logs.append(res["message"])
 
         if res["status"] == "new_post":
@@ -257,6 +289,7 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if direct_url:
                 try:
+                    await update_status("📥 Downloading video file for Telegram upload...")
                     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
                         response = await client.get(direct_url)
                         if response.status_code == 200:
@@ -268,7 +301,7 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                             sent = True
                 except Exception as stream_err:
-                    logger.warning(f"Video download/upload failed: {stream_err}")
+                    logger.warning(f"Video upload failed: {stream_err}")
 
             if not sent:
                 await context.bot.send_message(
@@ -277,7 +310,6 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
 
-            # REPLACE OLD ID WITH NEW ID IN STATE AND SAVE
             config["last_seen"][username] = post_id
             save_config()
 
@@ -285,7 +317,6 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.edit_text("\n".join(logs), parse_mode="HTML")
 
 async def scheduled_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    """Automatic background polling task."""
     users = list(config.get("monitored_users", []))
     for username in users:
         res = await process_account_check(username)
@@ -319,7 +350,6 @@ async def scheduled_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
 
-            # REPLACE OLD ID WITH NEW ID IN STATE AND SAVE
             config["last_seen"][username] = post_id
             save_config()
 
