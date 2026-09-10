@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
 import requests
+import yt_dlp
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
@@ -60,69 +61,54 @@ def save_config():
         except Exception as e:
             logger.error(f"Error saving config: {e}")
 
-# ================== TIKTOK ==================
+# ================== TIKTOK VIA YT-DLP ==================
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://www.tiktok.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
-def get_sec_uid(username: str) -> Optional[str]:
-    url = f"https://www.tiktok.com/@{username}"
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            return None
-        text = r.text
-        if '"secUid":"' in text:
-            start = text.find('"secUid":"') + len('"secUid":"')
-            end = text.find('"', start)
-            if end > start:
-                return text[start:end]
-    except Exception as e:
-        logger.warning(f"secUid error @{username}: {e}")
-    return None
-
-def get_latest_posts(username: str, count: int = 5) -> List[Dict]:
-    sec_uid = get_sec_uid(username)
-    if not sec_uid:
-        return []
-
-    url = "https://www.tiktok.com/api/post/item_list/"
-    params = {
-        "secUid": sec_uid,
-        "count": count,
-        "cursor": 0,
-        "aid": 1988,
-        "app_language": "en",
-        "device_platform": "web_pc",
+def get_latest_posts(username: str, max_results: int = 3) -> List[Dict]:
+    """Fetch the latest posts for a TikTok user using yt-dlp."""
+    profile_url = f"https://www.tiktok.com/@{username}"
+    
+    ydl_opts = {
+        'extract_flat': True,
+        'playlistend': max_results,
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
     }
 
+    posts = []
     try:
-        r = requests.get(url, headers=HEADERS, params=params, timeout=15)
-        if r.status_code == 200:
-            return r.json().get("itemList", []) or []
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            result = ydl.extract_info(profile_url, download=False)
+            if result and 'entries' in result:
+                for entry in result['entries']:
+                    if entry:
+                        posts.append({
+                            "id": entry.get("id"),
+                            "url": entry.get("url") or f"https://www.tiktok.com/@{username}/video/{entry.get('id')}",
+                            "title": entry.get("title") or ""
+                        })
     except Exception as e:
-        logger.warning(f"Posts error @{username}: {e}")
-    return []
+        logger.error(f"yt-dlp failed to fetch @{username}: {e}")
+    
+    return posts
 
-def extract_all_media(item: Dict) -> Tuple[List[str], Optional[str]]:
-    photos = []
-    video_url = None
-
-    video = item.get("video") or {}
-    play_addr = video.get("playAddr") or video.get("downloadAddr")
-    if play_addr:
-        video_url = play_addr
-
-    image_post = item.get("imagePost") or {}
-    images = image_post.get("images") or []
-    for img in images:
-        url_list = img.get("imageURL", {}).get("urlList") or []
-        if url_list:
-            photos.append(url_list[0])
-
-    return photos, video_url
+def get_direct_video_url(post_url: str) -> Optional[str]:
+    """Extract a direct playable MP4 link from a specific post URL."""
+    ydl_opts = {
+        'format': 'best',
+        'quiet': True,
+        'no_warnings': True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(post_url, download=False)
+            return info.get('url')
+    except Exception as e:
+        logger.warning(f"Failed to get direct video URL for {post_url}: {e}")
+        return None
 
 # ================== SENDING ==================
 def send_telegram_message(text: str):
@@ -141,48 +127,18 @@ def send_telegram_message(text: str):
 
 def send_video(video_url: str, caption: str) -> bool:
     try:
-        r = requests.get(video_url, headers=HEADERS, timeout=30)
-        if r.status_code == 200 and len(r.content) > 1000:
+        r = requests.get(video_url, headers=HEADERS, timeout=30, stream=True)
+        if r.status_code == 200:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo",
                 data={"chat_id": ALERT_CHAT_ID, "caption": caption},
-                files={"video": ("video.mp4", r.content)},
+                files={"video": ("video.mp4", r.raw)},
                 timeout=90,
             )
             return True
     except Exception as e:
         logger.warning(f"Failed to send video: {e}")
     return False
-
-def send_photos(photo_urls: List[str], caption: str) -> bool:
-    if not photo_urls:
-        return False
-    try:
-        media = []
-        files = {}
-        for i, url in enumerate(photo_urls[:10]):
-            r = requests.get(url, headers=HEADERS, timeout=20)
-            if r.status_code == 200:
-                file_name = f"photo{i}.jpg"
-                files[file_name] = r.content
-                media.append({
-                    "type": "photo",
-                    "media": f"attach://{file_name}",
-                    "caption": caption if i == 0 else ""
-                })
-        if not media:
-            return False
-        data = {"chat_id": ALERT_CHAT_ID, "media": json.dumps(media)}
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup",
-            data=data,
-            files=files,
-            timeout=60,
-        )
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to send photos: {e}")
-        return False
 
 # ================== CHECK LOGIC ==================
 def check_all_users(force: bool = False) -> int:
@@ -192,12 +148,14 @@ def check_all_users(force: bool = False) -> int:
 
     for username in users:
         try:
-            posts = get_latest_posts(username, count=3)
+            posts = get_latest_posts(username, max_results=3)
             if not posts:
+                logger.info(f"No posts found or scraping blocked for @{username}")
                 continue
 
             latest = posts[0]
             post_id = str(latest.get("id") or "")
+            post_url = latest.get("url")
 
             with config_lock:
                 last_seen = config["last_seen"].get(username)
@@ -212,16 +170,13 @@ def check_all_users(force: bool = False) -> int:
 
             caption = (
                 f"🆕 New post from @{username}\n\n"
-                f"https://www.tiktok.com/@{username}/video/{post_id}"
+                f"{post_url}"
             )
 
-            photos, video_url = extract_all_media(latest)
+            direct_url = get_direct_video_url(post_url)
             sent = False
-
-            if video_url:
-                sent = send_video(video_url, caption)
-            elif photos:
-                sent = send_photos(photos, caption)
+            if direct_url:
+                sent = send_video(direct_url, caption)
 
             if not sent:
                 send_telegram_message(caption)
@@ -366,7 +321,6 @@ if __name__ == "__main__":
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
 
-    # Increased timeouts to prevent TimedOut errors on Railway
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
