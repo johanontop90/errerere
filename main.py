@@ -186,7 +186,6 @@ def send_photos(photo_urls: List[str], caption: str) -> bool:
 
 # ================== CHECK LOGIC ==================
 def check_all_users(force: bool = False) -> int:
-    """Check all monitored users for new posts. Returns number of new posts found."""
     found = 0
     with config_lock:
         users = list(config.get("monitored_users", []))
@@ -209,7 +208,6 @@ def check_all_users(force: bool = False) -> int:
             if not force and post_id == last_seen:
                 continue
 
-            # New post (or force check)
             logger.info(f"{'Force check' if force else 'New post'} from @{username}: {post_id}")
 
             caption = (
@@ -320,7 +318,6 @@ async def checknow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Received /checknow from {update.effective_user.id}")
     await update.message.reply_text("🔍 Checking for new posts right now...")
 
-    # Run the check in a background thread so it doesn't block the bot
     def run_check():
         found = check_all_users(force=False)
         if found == 0:
@@ -369,7 +366,16 @@ if __name__ == "__main__":
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # Increased timeouts to prevent TimedOut errors on Railway
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
