@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
 import requests
-from telegram import Update, InputMediaPhoto
+from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 # ================== CONFIG ==================
@@ -56,6 +56,7 @@ def save_config():
         try:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(config, f, indent=2)
+            logger.info("Config saved successfully")
         except Exception as e:
             logger.error(f"Error saving config: {e}")
 
@@ -106,27 +107,20 @@ def get_latest_posts(username: str, count: int = 5) -> List[Dict]:
     return []
 
 def extract_all_media(item: Dict) -> Tuple[List[str], Optional[str]]:
-    """
-    Returns:
-        photos: list of photo URLs
-        video: video URL (or None)
-    """
     photos = []
     video_url = None
 
-    # Check for video
     video = item.get("video") or {}
     play_addr = video.get("playAddr") or video.get("downloadAddr")
     if play_addr:
         video_url = play_addr
 
-    # Check for image post (carousel)
     image_post = item.get("imagePost") or {}
     images = image_post.get("images") or []
     for img in images:
         url_list = img.get("imageURL", {}).get("urlList") or []
         if url_list:
-            photos.append(url_list[0])  # highest quality usually first
+            photos.append(url_list[0])
 
     return photos, video_url
 
@@ -149,6 +143,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Received /add from {update.effective_user.id}")
+    
     if not context.args:
         await update.message.reply_text("Usage: /add username")
         return
@@ -158,33 +153,44 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid username")
         return
 
-    with config_lock:
-        if username in config["monitored_users"]:
-            await update.message.reply_text(f"@{username} is already being monitored.")
-            return
-        config["monitored_users"].append(username)
-        config["last_seen"][username] = None
-        save_config()
+    try:
+        with config_lock:
+            if username in config["monitored_users"]:
+                await update.message.reply_text(f"@{username} is already being monitored.")
+                return
+            config["monitored_users"].append(username)
+            config["last_seen"][username] = None
 
-    await update.message.reply_text(f"✅ Now monitoring @{username}")
+        save_config()
+        await update.message.reply_text(f"✅ Now monitoring @{username}")
+        
+    except Exception as e:
+        logger.error(f"Error in /add: {e}")
+        await update.message.reply_text(f"❌ Failed to add @{username}. Error: {e}")
 
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Received /remove from {update.effective_user.id}")
+    
     if not context.args:
         await update.message.reply_text("Usage: /remove username")
         return
 
     username = context.args[0].lstrip("@").lower().strip()
 
-    with config_lock:
-        if username not in config["monitored_users"]:
-            await update.message.reply_text(f"@{username} is not being monitored.")
-            return
-        config["monitored_users"].remove(username)
-        config["last_seen"].pop(username, None)
-        save_config()
+    try:
+        with config_lock:
+            if username not in config["monitored_users"]:
+                await update.message.reply_text(f"@{username} is not being monitored.")
+                return
+            config["monitored_users"].remove(username)
+            config["last_seen"].pop(username, None)
 
-    await update.message.reply_text(f"✅ Removed @{username}")
+        save_config()
+        await update.message.reply_text(f"✅ Removed @{username}")
+        
+    except Exception as e:
+        logger.error(f"Error in /remove: {e}")
+        await update.message.reply_text(f"❌ Failed to remove @{username}. Error: {e}")
 
 async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Received /list from {update.effective_user.id}")
@@ -218,7 +224,7 @@ async def debug_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.text:
         logger.info(f"DEBUG - Received: {update.message.text} from {update.effective_user.id}")
 
-# ================== MONITORING ==================
+# ================== SENDING MEDIA ==================
 def send_telegram_message(text: str):
     try:
         requests.post(
@@ -233,7 +239,7 @@ def send_telegram_message(text: str):
     except Exception as e:
         logger.error(f"Failed to send message: {e}")
 
-def send_video(video_url: str, caption: str):
+def send_video(video_url: str, caption: str) -> bool:
     try:
         r = requests.get(video_url, headers=HEADERS, timeout=30)
         if r.status_code == 200 and len(r.content) > 1000:
@@ -248,8 +254,7 @@ def send_video(video_url: str, caption: str):
         logger.warning(f"Failed to send video: {e}")
     return False
 
-def send_photos(photo_urls: List[str], caption: str):
-    """Send multiple photos as a media group"""
+def send_photos(photo_urls: List[str], caption: str) -> bool:
     if not photo_urls:
         return False
 
@@ -257,7 +262,7 @@ def send_photos(photo_urls: List[str], caption: str):
         media = []
         files = {}
 
-        for i, url in enumerate(photo_urls[:10]):  # Telegram limit is 10
+        for i, url in enumerate(photo_urls[:10]):
             r = requests.get(url, headers=HEADERS, timeout=20)
             if r.status_code == 200:
                 file_name = f"photo{i}.jpg"
@@ -287,6 +292,7 @@ def send_photos(photo_urls: List[str], caption: str):
         logger.warning(f"Failed to send photos: {e}")
         return False
 
+# ================== MONITORING ==================
 def monitor_loop():
     logger.info("Monitoring thread started")
     while True:
@@ -318,15 +324,11 @@ def monitor_loop():
                 photos, video_url = extract_all_media(latest)
                 sent = False
 
-                # Prefer video if exists
                 if video_url:
                     sent = send_video(video_url, caption)
-
-                # Otherwise send all photos
                 elif photos:
                     sent = send_photos(photos, caption)
 
-                # Fallback to just the link
                 if not sent:
                     send_telegram_message(caption)
 
