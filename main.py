@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
 import httpx
-import yt_dlp
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -19,7 +18,6 @@ from telegram.ext import (
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
 CONFIG_FILE = "config.json"
-COOKIES_FILE = "cookies.txt"
 CHECK_INTERVAL = 300  # 5 minutes
 
 if not TELEGRAM_BOT_TOKEN or not ALERT_CHAT_ID:
@@ -62,82 +60,42 @@ def save_config():
     except Exception as e:
         logger.error(f"Error saving config: {e}")
 
-# ================== TIKTOK SCRAPER ==================
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-        "Version/17.0 Mobile/15E148 Safari/604.1"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.tiktok.com/",
-}
-
-def fetch_latest_posts(username: str, max_results: int = 3) -> List[Dict[str, Any]]:
-    """Fetch recent posts forcing live requests without cache."""
-    profile_url = f"https://www.tiktok.com/@{username}"
-    
-    ydl_opts: Dict[str, Any] = {
-        "extract_flat": True,
-        "playlistend": max_results,
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": True,
-        "cachedir": False,  # Force yt-dlp to bypass disk cache
-        "http_headers": HEADERS,
-        "extractor_args": {
-            "tiktok": {
-                "webpage_download": True,
-            }
-        }
+# ================== TIKWM API SCRAPER ==================
+async def fetch_latest_posts_tikwm(username: str, count: int = 5) -> List[Dict[str, Any]]:
+    """Fetch recent posts using TikWM public API (bypasses Railway IP bans)."""
+    url = f"https://www.tikwm.com/api/user/posts?unique_id={username}&count={count}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
     }
-
-    if os.path.exists(COOKIES_FILE):
-        ydl_opts["cookiefile"] = COOKIES_FILE
-
+    
     posts = []
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            result = ydl.extract_info(profile_url, download=False)
-            if result and "entries" in result:
-                for entry in result["entries"]:
-                    if entry and entry.get("id"):
+        async with httpx.AsyncClient(headers=headers, timeout=15.0) as client:
+            res = await client.get(url)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("code") == 0 and "data" in data and "videos" in data["data"]:
+                    for vid in data["data"]["videos"]:
+                        video_id = str(vid.get("video_id"))
+                        # TikWM returns direct mp4 link and watermarked options
                         posts.append({
-                            "id": str(entry.get("id")),
-                            "url": entry.get("url") or f"https://www.tiktok.com/@{username}/video/{entry.get('id')}",
-                            "title": entry.get("title") or "New TikTok Video"
+                            "id": video_id,
+                            "url": f"https://www.tiktok.com/@{username}/video/{video_id}",
+                            "direct_video_url": vid.get("play"),  # No-watermark MP4
+                            "title": vid.get("title") or "New TikTok Video"
                         })
+                else:
+                    logger.warning(f"TikWM response error for @{username}: {data.get('msg')}")
     except Exception as e:
-        logger.error(f"yt-dlp error for @{username}: {e}")
+        logger.error(f"TikWM request failed for @{username}: {e}")
 
     return posts
-
-def get_direct_video_stream(post_url: str) -> Optional[str]:
-    """Extract direct playable MP4 stream URL."""
-    ydl_opts: Dict[str, Any] = {
-        "format": "b[ext=mp4]/best[ext=mp4]/best",
-        "quiet": True,
-        "no_warnings": True,
-        "cachedir": False,
-        "http_headers": HEADERS,
-    }
-
-    if os.path.exists(COOKIES_FILE):
-        ydl_opts["cookiefile"] = COOKIES_FILE
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(post_url, download=False)
-            return info.get("url")
-    except Exception as e:
-        logger.warning(f"Failed stream extraction for {post_url}: {e}")
-        return None
 
 # ================== COMMAND HANDLERS ==================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome = (
-        "👋 <b>TikTok Monitor Bot</b>\n\n"
+        "👋 <b>TikTok Monitor Bot (TikWM Engine)</b>\n\n"
         "<b>Available Commands:</b>\n"
         "• /add &lt;username&gt; – Add user to monitoring list\n"
         "• /remove &lt;username&gt; – Remove user from monitoring list\n"
@@ -204,21 +162,19 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found_total = 0
 
     for idx, username in enumerate(users, start=1):
-        # Update progress header
         current_status = f"🔄 Checking [{idx}/{len(users)}]: <b>@{username}</b>..."
         await status_msg.edit_text("\n".join(logs + [current_status]), parse_mode="HTML")
 
-        # Run extraction non-blockingly
-        loop = asyncio.get_running_loop()
-        posts = await loop.run_in_executor(None, fetch_latest_posts, username, 3)
+        posts = await fetch_latest_posts_tikwm(username, count=3)
 
         if not posts:
-            logs.append(f"❌ <b>@{username}</b>: TikTok blocked request or 0 posts found.")
+            logs.append(f"❌ <b>@{username}</b>: Failed to fetch profile (Account private, changed name, or API busy).")
             continue
 
         latest = posts[0]
         post_id = latest.get("id")
         post_url = latest.get("url")
+        direct_url = latest.get("direct_video_url")
         last_seen = config["last_seen"].get(username)
 
         if post_id == last_seen:
@@ -227,14 +183,13 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logs.append(f"🆕 <b>@{username}</b>: <b>NEW POST DETECTED!</b> (ID: <code>{post_id}</code>)")
             found_total += 1
 
-            # Dispatch video/link alert to alert channel/user
             caption = f"🆕 <b>New post from @{username}</b>\n\n{post_url}"
-            direct_url = await loop.run_in_executor(None, get_direct_video_stream, post_url)
             sent = False
 
+            # Try downloading video directly and uploading to Telegram
             if direct_url:
                 try:
-                    async with httpx.AsyncClient(headers=HEADERS, timeout=60.0) as client:
+                    async with httpx.AsyncClient(timeout=60.0) as client:
                         res = await client.get(direct_url)
                         if res.status_code == 200:
                             await context.bot.send_video(
@@ -245,7 +200,7 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                             sent = True
                 except Exception as e:
-                    logger.warning(f"Could not send stream video: {e}")
+                    logger.warning(f"Could not send video stream: {e}")
 
             if not sent:
                 await context.bot.send_message(
@@ -254,7 +209,6 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
 
-            # Update state
             config["last_seen"][username] = post_id
             save_config()
 
@@ -290,5 +244,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("checknow", checknow_command))
     app.add_handler(CommandHandler("online", online_command))
 
-    logger.info("Bot running...")
+    logger.info("Bot starting up with TikWM API backend...")
     app.run_polling(drop_pending_updates=True)
