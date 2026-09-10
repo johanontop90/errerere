@@ -32,11 +32,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Thread-safe config
 config_lock = threading.Lock()
 config: Dict[str, Any] = {
-    "monitored_users": [],   # plain usernames (no @)
-    "last_seen": {}          # username -> last post id
+    "monitored_users": [],
+    "last_seen": {}
 }
 
 def load_config():
